@@ -7,6 +7,9 @@ class MLPProjector(nn.Module):
     Inspired by CheXagent paper's description, allowing variable expansion.
     Projects each patch embedding individually.
     """
+    # TODO: Experiment with the intermediate dimensions of the MLP projector.
+    # The CheXagent paper used a larger expansion (e.g., 10x input dim).
+    # Consider adding an argument to control the intermediate dimension size/ratio.
     def __init__(self, vision_dim: int, llm_dim: int, expansion_factor: int = 1):
         super().__init__()
         intermediate_dim = vision_dim * expansion_factor
