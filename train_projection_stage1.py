@@ -1,11 +1,9 @@
 import os
 import torch
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import logging
 import argparse
-from tqdm import tqdm
 from transformers import AutoProcessor, AutoModel, AutoModelForCausalLM, AutoTokenizer
 import json
 from accelerate import Accelerator, DistributedDataParallelKwargs
@@ -199,13 +197,7 @@ def main():
 
     # Make sure the projector dimensions match the frozen models
     # --- Use the imported MLPProjector ---
-    # TODO: Experiment with the intermediate dimensions of the MLP projector.
-    # The CheXagent paper used a larger expansion (e.g., 10x input dim).
-    # Consider adding an argument to control the intermediate dimension size/ratio.
-    projection = MLPProjector(vision_dim=vision_dim, llm_dim=llm_dim) # Default expansion factor is used here
-    # The MLP projects each patch token individually. The number of output tokens
-    # will be the same as the number of input patch tokens from the vision encoder.
-
+    projection = MLPProjector(vision_dim=vision_dim, llm_dim=llm_dim)
     logger.info(f"Initialized Projector ({type(projection).__name__}) with vision_dim={vision_dim}, llm_dim={llm_dim}. Output tokens = input patch tokens.")
 
 
@@ -223,8 +215,8 @@ def main():
     except Exception as e:
         logger.error(f"Failed to create dataset: {e}", exc_info=True)
         if accelerator.is_main_process and accelerator.log_with is not None:
-             accelerator.end_training() # End wandb run if dataset fails
-        return # Exit script
+             accelerator.end_training()
+        return
 
     # --- Create Trainer --- # Use the imported class
     trainer = ProjectionTrainerStage1(
