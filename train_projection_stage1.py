@@ -93,6 +93,8 @@ def main():
     parser.add_argument("--train_json", type=str, required=True, help="JSON file with training image-caption/report data")
     # Updated default output dir
     parser.add_argument("--output_dir", type=str, default="./trained_projection_stage1", help="Output directory for Stage 1 projector")
+    parser.add_argument("--vision_model_name", type=str, default="StanfordAIMI/XraySigLIP__vit-b-16-siglip-512__webli", help="Pre-trained vision encoder name or path.")
+    parser.add_argument("--llm_name", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", help="Pre-trained language model name or path.")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size *per GPU*.")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Peak learning rate for projector")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
@@ -154,26 +156,23 @@ def main():
     # --- Load Vision Encoder (Frozen) ---
     # Use the specific SigLIP model mentioned or your equivalent
     # TODO: Note that using ViT-Base here differs from the CheXagent paper's ViT-Large. Results may vary.
-    vision_model_name = "StanfordAIMI/XraySigLIP__vit-b-16-siglip-512__webli" # Or your pre-trained encoder
-    processor = AutoProcessor.from_pretrained(vision_model_name)
+    processor = AutoProcessor.from_pretrained(args.vision_model_name)
     vision_encoder = AutoModel.from_pretrained(
-        vision_model_name,
+        args.vision_model_name,
         torch_dtype=model_dtype,
         low_cpu_mem_usage=True
     )
-    logger.info(f"Loaded vision encoder: {vision_model_name}")
+    logger.info(f"Loaded vision encoder: {args.vision_model_name}")
 
     # --- Load Language Model (Frozen) ---
-    # Use the specific LLM mentioned or your equivalent (DeepSeek in your original)
     # TODO: Note that using DeepSeek-1.5B here differs from the CheXagent paper's LLM. Results may vary.
-    llm_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B" # Or your pre-trained LLM
-    llm_tokenizer = AutoTokenizer.from_pretrained(llm_name)
+    llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
     llm_model = AutoModelForCausalLM.from_pretrained(
-        llm_name,
+        args.llm_name,
         torch_dtype=model_dtype,
         low_cpu_mem_usage=True
     )
-    logger.info(f"Loaded language model: {llm_name}")
+    logger.info(f"Loaded language model: {args.llm_name}")
 
     # Handle padding token for tokenizer and model
     if llm_tokenizer.pad_token is None:
