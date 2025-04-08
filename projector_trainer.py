@@ -8,6 +8,7 @@ import logging
 import math
 from transformers import get_cosine_schedule_with_warmup
 import json
+from PIL import Image # Added for validation image loading
 
 # Setup logger for this module
 logger = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ class ProjectionTrainerStage1:
         logger.info(f"Process {self.accelerator.process_index}: Starting Stage 1 training for {self.num_epochs} epochs on device {self.device}")
 
         global_step = 0
+        best_val_loss = float('inf') # Initialize best validation loss tracking
 
         for epoch in range(self.num_epochs):
             self.projection_layer.train() # Set projector to train mode
@@ -252,7 +254,93 @@ class ProjectionTrainerStage1:
                 # Log epoch loss at the correct global step
                 self.accelerator.log(epoch_log_dict, step=global_step)
 
-            # --- Checkpointing ---
+            # --- Validation Step (on main process only) ---
+            if self.accelerator.is_main_process:
+                logger.info(f"Running validation inference for Epoch {epoch+1}...")
+                self.projection_layer.eval()
+                self.language_model.eval() # Ensure LLM is in eval for generation
+                # Vision encoder should already be in eval mode
+
+                val_image_path = "/home/compu/samuel/Siglip/images/001.png"
+                max_new_tokens_val = 512 # Limit generated tokens for validation output
+
+                try:
+                    with torch.no_grad():
+                        # --- Load and Process Validation Image ---
+                        image = Image.open(val_image_path).convert('RGB')
+                        if hasattr(self.processor, 'size'):
+                            img_size = self.processor.size.get("shortest_edge", self.processor.size.get("height", 384))
+                        else:
+                            logger.warning("Cannot determine processor size reliably, assuming 384x384 for validation.")
+                            img_size = 384
+                        image = image.resize((img_size, img_size))
+                        image_inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+                        pixel_values_val = image_inputs.pixel_values
+
+                        # --- Validation Inference (Generate Text) ---
+                        vision_dtype = next(self.vision_encoder.parameters()).dtype
+                        if hasattr(self.vision_encoder, 'module'):
+                             vision_tower = self.vision_encoder.module.vision_model
+                        else:
+                            vision_tower = self.vision_encoder.vision_model
+                        vision_outputs = vision_tower(
+                            pixel_values=pixel_values_val.to(vision_dtype),
+                            output_hidden_states=False, return_dict=True
+                        )
+                        patch_embeddings = vision_outputs.last_hidden_state[:, 1:, :]
+                        projected_embeds = self.projection_layer(patch_embeddings)
+
+                        # Prepare attention mask for generation (all ones for visual input)
+                        inputs_embeds = projected_embeds
+                        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=self.device)
+
+                        # Generate text using LLM
+                        # Use simple generation parameters for validation output
+                        outputs = self.language_model.generate(
+                            inputs_embeds=inputs_embeds,
+                            attention_mask=attention_mask,
+                            max_new_tokens=max_new_tokens_val,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                            do_sample=False # Use greedy decoding for consistent validation output
+                        )
+                        
+                        # Decode generated tokens (generate returns only new tokens when using inputs_embeds)
+                        generated_ids = outputs[0] 
+                        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+                        # Log the generated text
+                        logger.info(f"Epoch {epoch+1}/{self.num_epochs} - Validation Image ({os.path.basename(val_image_path)}) Generated Text:\n{generated_text}")
+                        
+                        # Log to WandB if enabled
+                        if self.accelerator.trackers:
+                             try:
+                                 # Log as text to WandB table
+                                 val_table_data = [[epoch+1, global_step, os.path.basename(val_image_path), generated_text]]
+                                 # Check if tracker exists before logging
+                                 if "wandb" in self.accelerator.trackers:
+                                     wandb_tracker = self.accelerator.get_tracker("wandb")
+                                     if wandb_tracker is not None:
+                                         # Ensure wandb is imported if using wandb directly
+                                         import wandb 
+                                         val_table = wandb.Table(columns=["Epoch", "Step", "Image", "Generated Text"], data=val_table_data)
+                                         wandb_tracker.log({"validation_generations": val_table})
+                                 else:
+                                     logger.warning("Wandb tracker not found, cannot log validation table.")
+                                
+                             except Exception as log_e:
+                                 logger.warning(f"Could not log validation text to WandB: {log_e}")
+
+                except FileNotFoundError:
+                     logger.error(f"Validation image not found at {val_image_path}. Skipping validation.")
+                except Exception as e:
+                     logger.error(f"Error during validation inference step: {e}", exc_info=True)
+                finally:
+                    # Ensure model is back in training mode
+                    self.projection_layer.train()
+
+            # --- Regular Checkpointing --- 
+            # Note: No longer saving based on best val loss
             if (epoch + 1) % 5 == 0 or epoch == self.num_epochs - 1:
                     if self.accelerator.is_main_process:
                         save_path = os.path.join(self.output_dir, f"checkpoint-epoch{epoch+1}")
