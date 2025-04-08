@@ -1,11 +1,13 @@
 import logging
-import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
 
-def setup_accelerator_and_logging(args):
-    """Initializes Accelerator, logging, WandB, device, and model dtype."""
-    logger = logging.getLogger(__name__) # Logger for this module
+# Setup logger for this module (optional, if setup function logs directly)
+logger = logging.getLogger(__name__)
 
+def setup_accelerator_and_logging(args):
+    """Initializes Accelerator, sets up logging, and initializes trackers."""
+
+    # Initialize Accelerator
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -14,14 +16,14 @@ def setup_accelerator_and_logging(args):
     )
 
     # Setup logging level based on process rank
-    # Reconfigure root logger based on rank using force=True
     log_level = logging.INFO if accelerator.is_main_process else logging.WARNING
+    # Configure root logger
     logging.basicConfig(
-        level=log_level,
+        level=log_level, 
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        force=True
+        force=True # Force re-configuration if already configured
     )
-    logger.info(f"Logging level set to {log_level}")
+    logger.info(f"Logging level set to {log_level}") # Use the module logger
 
     if accelerator.is_main_process:
         logger.info(f"Accelerator state: {accelerator.state}")
@@ -34,6 +36,7 @@ def setup_accelerator_and_logging(args):
          if args.wandb_run_name:
              wandb_kwargs["name"] = args.wandb_run_name
          try:
+            # Make sure project name is passed correctly
             accelerator.init_trackers(
                 project_name=args.wandb_project,
                 config=vars(args),
@@ -42,13 +45,10 @@ def setup_accelerator_and_logging(args):
             logger.info(f"Initialized WandB tracker for project: {args.wandb_project}")
          except Exception as e:
              logger.error(f"Failed to initialize WandB tracker via Accelerator: {e}. Disabling WandB.")
-             accelerator.log_with = None # Ensure accelerator knows wandb is disabled
+             # Ensure wandb logging is skipped later if init fails by setting accelerator's log_with correctly
+             accelerator.log_with = None # Turn off logging if init failed
 
-    device = accelerator.device
-    logger.info(f"Process {accelerator.process_index} using device: {device}")
+    # Log device info after setup
+    logger.info(f"Process {accelerator.process_index} using device: {accelerator.device}")
 
-    # Determine Model dtype
-    model_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-    logger.info(f"Using model dtype: {model_dtype}")
-
-    return accelerator, device, model_dtype 
+    return accelerator 

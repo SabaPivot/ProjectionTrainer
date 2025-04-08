@@ -6,11 +6,11 @@ import logging
 import argparse
 from transformers import AutoProcessor, AutoModel, AutoModelForCausalLM, AutoTokenizer
 import json
-from accelerate import Accelerator, DistributedDataParallelKwargs
 from projectors import MLPProjector
 from projector_trainer import ProjectionTrainerStage1
+from accelerator_setup import setup_accelerator_and_logging
 
-# Set up logging
+# Set up logging (Initial basicConfig, might be overridden by setup function)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -109,44 +109,9 @@ def main():
 
     args = parser.parse_args()
 
-    # Initialize Accelerator
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False) # Generally False is fine if only projector is trained
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        kwargs_handlers=[ddp_kwargs],
-        log_with="wandb" if not args.disable_wandb else None
-    )
-
-    # Setup logging level based on process rank
-    log_level = logging.INFO if accelerator.is_main_process else logging.WARNING
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logger.info(f"Logging level set to {log_level}")
-
-    if accelerator.is_main_process:
-        logger.info(f"Accelerator state: {accelerator.state}")
-        logger.info(f"Using {accelerator.num_processes} processes.")
-        logger.info(f"Effective batch size: {args.batch_size * accelerator.num_processes * args.gradient_accumulation_steps}")
-
-    # Initialize WandB tracker via Accelerator
-    if accelerator.is_main_process and not args.disable_wandb:
-         wandb_kwargs = {}
-         if args.wandb_run_name:
-             wandb_kwargs["name"] = args.wandb_run_name
-         try:
-            # Make sure project name is passed correctly
-            accelerator.init_trackers(
-                project_name=args.wandb_project,
-                config=vars(args),
-                init_kwargs={"wandb": wandb_kwargs}
-            )
-            logger.info(f"Initialized WandB tracker for project: {args.wandb_project}")
-         except Exception as e:
-             logger.error(f"Failed to initialize WandB tracker via Accelerator: {e}. Disabling WandB.")
-             # Ensure wandb logging is skipped later if init fails by setting accelerator's log_with correctly
-             accelerator.log_with = None # Turn off logging if init failed
-
-    device = accelerator.device
-    logger.info(f"Process {accelerator.process_index} using device: {device}")
+    # Initialize Accelerator, logging, and trackers using the setup function
+    accelerator = setup_accelerator_and_logging(args)
+    device = accelerator.device # Get device after accelerator is initialized
 
     # Load Models
     logger.info(f"Process {accelerator.process_index}: Loading base models (will be frozen)...")
@@ -199,7 +164,8 @@ def main():
             args.image_root,
             args.train_json,
             processor,
-            llm_tokenizer
+            llm_tokenizer,
+            img_size=args.img_size,
             # Add max_length if needed by tokenizer in dataset
         )
         logger.info(f"Loaded dataset with {len(train_dataset)} samples.")
