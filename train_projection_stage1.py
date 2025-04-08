@@ -21,15 +21,15 @@ logger = logging.getLogger(__name__)
 # This aligns with the CheXagent paper's description.
 class XrayTextPairDataset(Dataset):
     """Dataset for X-ray images and their text descriptions (captions/reports) from JSON"""
-    def __init__(self, image_root, json_file, processor, tokenizer, max_length=512):
+    def __init__(self, image_root, json_file, processor, tokenizer, img_size, max_length=512):
         self.image_root = image_root
+        self.img_size = img_size
         self.processor = processor
         self.tokenizer = tokenizer
         self.max_length = max_length
         try:
             with open(json_file, 'r', encoding='utf-8') as f:
                 self.samples = json.load(f)
-            # logger.info(f"Loaded {len(self.samples)} samples from {json_file}") # Log after accelerator setup
         except FileNotFoundError:
             print(f"ERROR: JSON file not found at {json_file}")
             raise
@@ -51,7 +51,7 @@ class XrayTextPairDataset(Dataset):
             image_path = os.path.join(self.image_root, image_filename)
 
             image = Image.open(image_path).convert('RGB')
-            image = image.resize((512, 512))
+            image = image.resize((self.img_size, self.img_size))
             image_inputs = self.processor(images=image, return_tensors="pt")
 
             # Tokenize the target caption/report
@@ -105,6 +105,7 @@ def main():
     parser.add_argument("--wandb_log_freq", type=int, default=100, help="Log gradients/params to WandB every N steps (if watched)")
     parser.add_argument("--disable_wandb", action='store_true', help="Disable Weights & Biases logging")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="Number of steps to accumulate gradients over.")
+    parser.add_argument("--img_size", type=int, default=384, help="Image size")
 
     args = parser.parse_args()
 
@@ -155,7 +156,6 @@ def main():
 
     # --- Load Vision Encoder (Frozen) ---
     # Use the specific SigLIP model mentioned or your equivalent
-    # TODO: Note that using ViT-Base here differs from the CheXagent paper's ViT-Large. Results may vary.
     processor = AutoProcessor.from_pretrained(args.vision_model_name)
     vision_encoder = AutoModel.from_pretrained(
         args.vision_model_name,
@@ -165,7 +165,6 @@ def main():
     logger.info(f"Loaded vision encoder: {args.vision_model_name}")
 
     # --- Load Language Model (Frozen) ---
-    # TODO: Note that using DeepSeek-1.5B here differs from the CheXagent paper's LLM. Results may vary.
     llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
     llm_model = AutoModelForCausalLM.from_pretrained(
         args.llm_name,
@@ -183,7 +182,7 @@ def main():
 
     # --- Initialize Projector (Trainable) ---
     logger.info("Initializing projector (Trainable Component)...")
-    # Assuming SigLIP base model for vision dim
+    
     vision_dim = vision_encoder.config.vision_config.hidden_size
     llm_dim = llm_model.config.hidden_size
 
