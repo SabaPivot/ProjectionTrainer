@@ -1,0 +1,13 @@
+*.png
+
+Single-Layer/
+
+wandb/
+
+trained_projection_stage1/
+
+__pycache__/
+
+log*
+
+test.py
