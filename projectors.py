@@ -10,7 +10,7 @@ class MLPProjector(nn.Module):
     # TODO: Experiment with the intermediate dimensions of the MLP projector.
     # The CheXagent paper used a larger expansion (e.g., 10x input dim).
     # Consider adding an argument to control the intermediate dimension size/ratio.
-    def __init__(self, vision_dim: int, llm_dim: int, expansion_factor: int = 1):
+    def __init__(self, vision_dim: int, llm_dim: int, expansion_factor: int = 10):
         super().__init__()
         intermediate_dim = vision_dim * expansion_factor
         self.model = nn.Sequential(
