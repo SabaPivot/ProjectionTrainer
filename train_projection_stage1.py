@@ -183,16 +183,9 @@ def main():
 
     # --- Initialize Projector (Trainable) ---
     logger.info("Initializing projector (Trainable Component)...")
-    try:
-        # Assuming SigLIP base model for vision dim
-        vision_dim = vision_encoder.config.vision_config.hidden_size
-        llm_dim = llm_model.config.hidden_size
-    except AttributeError as e:
-        logger.error(f"Could not automatically determine model dimensions from configs: {e}. Using fallbacks.")
-        # Provide reasonable fallbacks if needed, e.g., based on model names
-        vision_dim = 1024 # Example for SigLIP-L
-        llm_dim = llm_model.config.hidden_size # Usually reliable #llm_dim = 1536
-        logger.warning(f"Using fallback vision_dim={vision_dim}, llm_dim={llm_dim}")
+    # Assuming SigLIP base model for vision dim
+    vision_dim = vision_encoder.config.vision_config.hidden_size
+    llm_dim = llm_model.config.hidden_size
 
     # Make sure the projector dimensions match the frozen models
     # --- Use the imported MLPProjector ---
