@@ -211,20 +211,32 @@ class ProjectionTrainerStage1:
                         self.lr_scheduler.step()
                         self.optimizer.zero_grad()
                         global_step += 1
+                        
+                        # --- Accumulate loss ONLY on optimizer steps ---
+                        # Gather loss across all GPUs for the batches contributing to this step
+                        # Note: We still use the 'loss' from the last micro-batch for logging simplicity,
+                        #       a more precise average would require storing/averaging losses over accumulation steps.
+                        avg_loss_step = self.accelerator.gather(loss).mean().item() 
+                        epoch_train_loss += avg_loss_step
 
-                # --- Logging and Metric Accumulation ---
-                avg_loss = self.accelerator.gather(loss).mean().item()
-                epoch_train_loss += avg_loss
+                # --- Logging and Metric Accumulation (Log status after each micro-batch) ---
+                # Gather loss across all GPUs for the current micro-batch for logging purposes
+                current_avg_micro_batch_loss = self.accelerator.gather(loss).mean().item()
 
-                if self.accelerator.is_main_process and self.accelerator.sync_gradients:
-                    current_step_for_logging = global_step # Correct step for logging after optimizer step
+                if self.accelerator.is_main_process and self.accelerator.sync_gradients: # Log only when gradients are synced
+                    current_step_for_logging = global_step # Use global_step AFTER incrementing
                     log_dict = {
-                        "train/batch_loss": avg_loss,
+                        # Log the loss from the specific step that just completed
+                        "train/batch_loss": avg_loss_step, 
                         "train/learning_rate": self.lr_scheduler.get_last_lr()[0],
                         "step": current_step_for_logging
                     }
                     self.accelerator.log(log_dict, step=current_step_for_logging)
-                    progress_bar.set_postfix({"loss": avg_loss})
+                    # Show the current micro-batch loss in progress bar for more frequent updates
+                    progress_bar.set_postfix({"micro_loss": current_avg_micro_batch_loss, "lr": self.lr_scheduler.get_last_lr()[0]})
+                elif self.accelerator.is_main_process:
+                    # Update progress bar even if not logging step, showing micro-batch loss
+                    progress_bar.set_postfix({"micro_loss": current_avg_micro_batch_loss, "lr": self.lr_scheduler.get_last_lr()[0]})
 
             # --- End of Epoch ---
             # Calculate average epoch loss based on optimizer steps
