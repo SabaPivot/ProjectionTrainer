@@ -1,0 +1,7 @@
+accelerate==1.6.0
+Pillow==11.1.0
+safetensors==0.5.3
+torch==2.5.1
+tqdm==4.67.1
+transformers==4.51.0
+wandb==0.19.9
