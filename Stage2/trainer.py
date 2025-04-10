@@ -8,28 +8,37 @@ import logging
 import math
 from transformers import get_cosine_schedule_with_warmup
 import json
-from PIL import Image # Keep for potential validation
 from torch.nn.utils.rnn import pad_sequence
 from functools import partial
 
-# Setup logger for this module
 logger = logging.getLogger(__name__)
 
 # --- Custom Collate Function ---
 def vqa_collate_fn(batch, pad_token_id):
     """Collate function for VQADataset.
 
-    Pads question_input_ids to the max length in the batch.
-    Stacks pixel_values and already padded answer_input_ids.
+    Pads question_input_ids and answer_input_ids to the max length in the batch. ==> Dynamic padding
+    
+    Pros: 
+    - Computational Efficiency
+    - Memory Efficiency
+
+    Stacks pixel_values.
     """
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
-    answer_input_ids = torch.stack([item["answer_input_ids"] for item in batch])
 
     # Pad question_input_ids
     question_input_ids_list = [item["question_input_ids"] for item in batch]
-    # Use batch_first=True and specify padding_value
     question_input_ids_padded = pad_sequence(
         question_input_ids_list,
+        batch_first=True,
+        padding_value=pad_token_id
+    )
+
+    # Pad answer_input_ids
+    answer_input_ids_list = [item["answer_input_ids"] for item in batch]
+    answer_input_ids_padded = pad_sequence(
+        answer_input_ids_list,
         batch_first=True,
         padding_value=pad_token_id
     )
@@ -37,7 +46,7 @@ def vqa_collate_fn(batch, pad_token_id):
     return {
         "pixel_values": pixel_values,
         "question_input_ids": question_input_ids_padded,
-        "answer_input_ids": answer_input_ids,
+        "answer_input_ids": answer_input_ids_padded,
     }
 
 class VQATrainerStage2:
@@ -50,23 +59,22 @@ class VQATrainerStage2:
     def __init__(
         self,
         accelerator,
-        vision_encoder, # Frozen
-        language_model, # Fine-tuned (or parts of it)
-        projection_layer, # Potentially fine-tuned
-        tokenizer, # LLM tokenizer
+        vision_encoder,
+        language_model,
+        projection_layer,
+        tokenizer,
         train_dataset,
-        output_dir="./trained_vqa_stage2",
-        batch_size=4, # Adjusted default batch size for potentially larger memory footprint
-        learning_rate=2e-5, # Often lower for fine-tuning LLM
-        weight_decay=0.01,
-        num_epochs=5, # Often fewer epochs for fine-tuning
-        gradient_accumulation_steps=1,
-        warmup_ratio=0.05, # Common default for fine-tuning
-        freeze_vision_encoder=True,
-        freeze_projection_layer=False, # Typically fine-tune projector too
-        freeze_llm=False, # Fine-tune the LLM
-        # Add params for potential LLM layer freezing/LoRA later if needed
-        wandb_project="xray_vqa_training_stage2"
+        output_dir: str,
+        batch_size: int,
+        learning_rate: float,
+        weight_decay: float,
+        num_epochs: int,
+        gradient_accumulation_steps: int,
+        warmup_ratio: float,
+        freeze_vision_encoder: bool,
+        freeze_projection_layer: bool,
+        freeze_llm: bool,
+        wandb_project: str
     ):
         self.accelerator = accelerator
         self.vision_encoder = vision_encoder
@@ -91,7 +99,7 @@ class VQATrainerStage2:
             shuffle=True,
             num_workers=4,
             pin_memory=True,
-            collate_fn=collate_fn_partial # Use the custom collate function
+            collate_fn=collate_fn_partial
         )
 
         # --- Freezing Strategy --- Apply before optimizer creation
@@ -115,7 +123,6 @@ class VQATrainerStage2:
         else:
             self.language_model.requires_grad_(True)
             logger.info("Language model parameters are trainable.")
-            # Optional: Add logic here to freeze only specific LLM layers if desired
 
         # Optimizer targets trainable parameters
         trainable_params = list(filter(lambda p: p.requires_grad, self.language_model.parameters()))
