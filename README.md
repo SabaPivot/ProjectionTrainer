@@ -4,7 +4,28 @@
 
 This project implements a multi-modal Vision-Language Model (VLM) specifically designed for Chest X-Ray (CXR) analysis. Inspired by the CheXagent methodology, it leverages a pre-trained SigLIP vision encoder and a Gemma3 language model, connecting them via a trained MLP projector. The model takes a CXR image and a text instruction (e.g., a question) as input and generates a free-form text response.
 
-The training process involves two distinct stages: first aligning the vision and language modalities by training the projector, and then fine-tuning the language model (and optionally other components) on instruction-following VQA tasks.
+## Relation to CheXagent Paper
+
+This implementation follows the core principles outlined in the CheXagent paper but differs in specific component choices and pre-training details:
+
+**Similarities:**
+
+*   **Three Core Components:** Adopts the structure of (1) an image encoder, (2) a vision-language projector, and (3) a language decoder.
+*   **Two-Stage Training:** Implements a two-stage training process:
+    1.  **Projector Alignment (Stage 1):** Trains the vision-language projector using image-text pairs with the image encoder and language model weights frozen, similar to Fig. 2d in the paper. The objective is causal language modeling loss on the text tokens.
+    2.  **Instruction Fine-tuning (Stage 2):** Fine-tunes the model (primarily LLM, optionally projector and VE) using (instruction, image, response) triplets. The objective is causal language modeling loss on the response tokens.
+*   **Vision Encoder Freezing Strategy (Stage 2):** Includes an option (`--train_ve_first_epoch`) to mimic the paper's strategy of keeping the image encoder unfrozen for the first epoch of Stage 2 and freezing it subsequently.
+*   **Projector Architecture:** Uses a Multi-Layer Perceptron (MLP) for the vision-language projector.
+
+**Differences:**
+
+*   **Base Models:**
+    *   **Image Encoder:** This project uses a pre-trained SigLIP model (e.g., `StanfordAIMI/XraySigLIP__vit-l-16-siglip-384__webli`). The paper used SigLIP-Large and further fine-tuned it on CXR image-text pairs using the SigLIP loss before Stage 1 projector training. *This implementation currently omits the dedicated vision encoder fine-tuning stage described in the paper.*
+    *   **Language Decoder:** This project uses a pre-trained Gemma3 model (e.g., `google/gemma-3-1b-it`). The paper trained a custom Phi-2 model on a large medical and general text corpus. *This implementation relies on the general capabilities of the pre-trained Gemma3 model.*
+*   **Data:** The specific datasets used for Stage 1 (image-text) and Stage 2 (instruction-image-response) might differ from the CheXinstruct dataset used in the paper.
+*   **Projector Dimensions:** The projector maps from the specific SigLIP variant's dimension (e.g., 1024 for ViT-L) to the Gemma3 dimension (e.g., 2560 for 1B), matching the concept but potentially differing in exact values from the paper (1024 to 2560).
+
+**In essence, this project provides a framework replicating the CheXagent *alignment and fine-tuning stages (Fig 2d and subsequent steps)* using readily available pre-trained components, while omitting the computationally intensive custom pre-training/fine-tuning of the base vision and language models described in the earlier stages of the paper.**
 
 ## Model Architecture
 
@@ -19,11 +40,11 @@ The model comprises three main components:
 
 ## Training Process
 
-A two-stage training approach is employed:
+A two-stage training approach is employed, analogous to the later stages described in the CheXagent paper:
 
 ### Stage 1: Vision-Language Projector Training (`Stage1/`)
 
-*   **Goal:** Align the vision encoder's output space with the language model's input space by training the MLP projector.
+*   **Goal:** Align the vision encoder's output space with the language model's input space by training the MLP projector (similar to Fig. 2d in CheXagent).
 *   **Method:**
     *   The SigLIP vision encoder and Gemma3 language model weights are **frozen**.
     *   Only the **MLP Projector** weights are trained.
