@@ -58,7 +58,7 @@ class XrayVQADataset(Dataset):
             sample = self.samples[idx]
             image_filename = sample.get("image")
             question_text = sample.get("problem")
-            answer_text = sample.get("normal_caption") # Using 'normal_caption' as the answer
+            answer_text = sample.get("normal_caption")
 
             if not all([image_filename, question_text, answer_text]):
                 logger.warning(f"Sample {idx} is missing required fields (image, problem, or normal_caption). Skipping.")
@@ -68,42 +68,36 @@ class XrayVQADataset(Dataset):
 
             # --- Image Processing ---
             image = Image.open(image_path).convert('RGB')
-            image = image.resize((self.img_size, self.img_size))
+            image = image.resize((self.img_size, self.img_size)) # Align with the vision encoder
             # Note: processor likely adds batch dim, remove it here, add back in dataloader collate_fn if needed
-            image_inputs = self.processor(images=image, return_tensors="pt")
-            pixel_values = image_inputs.pixel_values.squeeze(0)
+            image_inputs = self.processor(images=image, return_tensors="pt") # Pytorch tensor
+            pixel_values = image_inputs.pixel_values.squeeze(0) # Remove batch dim
 
             # --- Text Tokenization ---
-            # Tokenize Question (problem) - no padding needed here usually, as it's concatenated
+            # (padding handled in collate_fn)
+
+            # Tokenize Question (problem)
             question_tokens = self.tokenizer(
                 question_text,
                 max_length=self.max_q_len,
                 truncation=True,
-                add_special_tokens=False # Often don't add BOS/EOS here, handled during concatenation
+                add_special_tokens=False # Vision encoder will add special tokens (<s>, </s> etc.)
             ).input_ids
 
-            # Tokenize Answer (normal_caption) - requires padding and label masking
-            answer_tokens_full = self.tokenizer(
+            # Tokenize Answer (normal_caption)
+            answer_tokens = self.tokenizer(
                 answer_text,
                 max_length=self.max_a_len,
-                padding="max_length", # Pad answers to max length
                 truncation=True,
-                return_tensors="pt" # Get tensors directly
-            )
-            answer_input_ids = answer_tokens_full.input_ids.squeeze(0) # Remove batch dim
-
-            # Create labels: shift tokens right, replace padding with -100
-            # In standard Causal LM training, labels are input_ids shifted right.
-            # We will handle the full sequence concatenation and label creation in the Trainer.
-            # Here, we just provide the raw token IDs for question and answer.
+            ).input_ids
 
             # The trainer will concatenate: [VISUAL_TOKENS] + [QUESTION_TOKENS] + [ANSWER_TOKENS]
             # The labels will be: [-100] * len(VISUAL+QUESTION) + [ANSWER_TOKENS] (with padding as -100)
 
             return {
                 "pixel_values": pixel_values,
-                "question_input_ids": torch.tensor(question_tokens, dtype=torch.long), # Tensor format
-                "answer_input_ids": answer_input_ids, # Already a tensor, padded
+                "question_input_ids": question_tokens, # A list of token IDs
+                "answer_input_ids": answer_tokens, # A list of token IDs
             }
 
         except FileNotFoundError:
