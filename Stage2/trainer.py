@@ -91,6 +91,7 @@ class VQATrainerStage2:
             os.makedirs(output_dir, exist_ok=True)
 
         # --- Use functools.partial to pass pad_token_id to collate_fn ---
+        # collator in DataLoader receives only the batch argument
         collate_fn_partial = partial(vqa_collate_fn, pad_token_id=self.tokenizer.pad_token_id)
 
         self.train_loader = DataLoader(
@@ -102,38 +103,12 @@ class VQATrainerStage2:
             collate_fn=collate_fn_partial
         )
 
-        # --- Freezing Strategy --- Apply before optimizer creation
-        if freeze_vision_encoder:
-            self.vision_encoder.requires_grad_(False)
-            logger.info("Freezing vision encoder parameters.")
-        else:
-            self.vision_encoder.requires_grad_(True)
-            logger.info("Vision encoder parameters are trainable.")
-
-        if freeze_projection_layer:
-            self.projection_layer.requires_grad_(False)
-            logger.info("Freezing projection layer parameters.")
-        else:
-            self.projection_layer.requires_grad_(True)
-            logger.info("Projection layer parameters are trainable.")
-
-        if freeze_llm:
-            self.language_model.requires_grad_(False)
-            logger.info("Freezing language model parameters.")
-        else:
-            self.language_model.requires_grad_(True)
-            logger.info("Language model parameters are trainable.")
-
-        # Optimizer targets trainable parameters
-        trainable_params = list(filter(lambda p: p.requires_grad, self.language_model.parameters()))
-        if not freeze_projection_layer:
-            trainable_params.extend(list(filter(lambda p: p.requires_grad, self.projection_layer.parameters())))
-        if not freeze_vision_encoder:
-            trainable_params.extend(list(filter(lambda p: p.requires_grad, self.vision_encoder.parameters())))
-
-        if not trainable_params:
-             raise ValueError("No trainable parameters found. Check freezing configuration.")
-
+        # --- Setup Trainable Parameters and Optimizer ---
+        trainable_params = self._setup_trainable_parameters(
+            freeze_vision_encoder=freeze_vision_encoder,
+            freeze_projection_layer=freeze_projection_layer,
+            freeze_llm=freeze_llm
+        )
         self.optimizer = optim.AdamW(
             trainable_params,
             lr=learning_rate,
@@ -177,6 +152,31 @@ class VQATrainerStage2:
         self.optimizer, self.train_loader, self.lr_scheduler = self.accelerator.prepare(
             self.optimizer, self.train_loader, self.lr_scheduler
         )
+
+    def _setup_trainable_parameters(self, freeze_vision_encoder: bool, freeze_projection_layer: bool, freeze_llm: bool) -> list:
+        """Applies freezing strategy and collects parameters for the optimizer."""
+        models = {
+            'vision_encoder': (self.vision_encoder, freeze_vision_encoder),
+            'projection_layer': (self.projection_layer, freeze_projection_layer),
+            'language_model': (self.language_model, freeze_llm)
+        }
+
+        trainable_params = []
+        for name, (model, should_freeze) in models.items():
+            if should_freeze:
+                model.requires_grad_(False)
+                logger.info(f"Freezing {name} parameters.")
+            else:
+                model.requires_grad_(True)
+                logger.info(f"{name} parameters are trainable.")
+                # Collect parameters only if the model is not frozen
+                trainable_params.extend(list(filter(lambda p: p.requires_grad, model.parameters())))
+
+        if not trainable_params:
+            raise ValueError("No trainable parameters found. Check freezing configuration.")
+
+        logger.info(f"Collected {len(trainable_params)} trainable parameters for the optimizer.")
+        return trainable_params
 
     def train(self):
         """Train the VQA model (Stage 2)"""
