@@ -5,6 +5,7 @@ from PIL import Image
 import logging
 import argparse
 from transformers import AutoProcessor, AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import Gemma3ForCausalLM
 import json
 from projectors import MLPProjector
 from projector_trainer import ProjectionTrainerStage1
@@ -131,7 +132,7 @@ def main():
 
     # --- Load Language Model (Frozen) ---
     llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
-    llm_model = AutoModelForCausalLM.from_pretrained(
+    llm_model = Gemma3ForCausalLM.from_pretrained(
         args.llm_name,
         torch_dtype=model_dtype,
         low_cpu_mem_usage=True
