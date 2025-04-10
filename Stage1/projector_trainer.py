@@ -78,13 +78,17 @@ class ProjectionTrainerStage1:
         )
         logger.info(f"Initialized cosine LR scheduler with {num_warmup_steps} warmup steps.")
 
-        # Prepare components with Accelerator
-        # Crucially, vision_encoder and language_model are prepared but their parameters won't get gradients
-        self.projection_layer, self.optimizer, self.train_loader, self.lr_scheduler, self.vision_encoder, self.language_model = self.accelerator.prepare(
-            self.projection_layer, self.optimizer, self.train_loader, self.lr_scheduler, self.vision_encoder, self.language_model
+        # Prepare components with Accelerator - SEPARATELY for DeepSpeed
+        # Prepare trainable layer, optimizer, dataloader, scheduler together
+        self.projection_layer, self.optimizer, self.train_loader, self.lr_scheduler = self.accelerator.prepare(
+            self.projection_layer, self.optimizer, self.train_loader, self.lr_scheduler
         )
+        
+        # Prepare frozen models individually using prepare_model for device placement/wrapping only
+        self.vision_encoder = self.accelerator.prepare_model(self.vision_encoder, device_placement=True)
+        self.language_model = self.accelerator.prepare_model(self.language_model, device_placement=True)
 
-        # --- Freezing Strategy ---
+        # --- Freezing Strategy --- (Apply after prepare)
         # Freeze vision encoder and language model completely
         self.vision_encoder.requires_grad_(False)
         self.language_model.requires_grad_(False)
@@ -117,109 +121,108 @@ class ProjectionTrainerStage1:
             )
 
             for batch in progress_bar:
-                with self.accelerator.accumulate(self.projection_layer):
-                    pixel_values = batch["pixel_values"]
-                    token_ids = batch["token_ids"] # Get original token IDs
-                    labels = batch["labels"]       # Get labels with -100
+                pixel_values = batch["pixel_values"]
+                token_ids = batch["token_ids"] # Get original token IDs
+                labels = batch["labels"]       # Get labels with -100
 
-                    # === Get Visual Features ===
-                    with torch.no_grad(): # Ensure no gradients for vision encoder
-                        vision_dtype = next(self.vision_encoder.parameters()).dtype
-                        try:
-                            # Handle DDP wrapping
-                            if self.accelerator.num_processes > 1 and hasattr(self.vision_encoder, 'module'):
-                                vision_tower = self.vision_encoder.module.vision_model
-                            else:
-                                vision_tower = self.vision_encoder.vision_model
-
-                            vision_outputs = vision_tower(
-                                pixel_values=pixel_values.to(vision_dtype),
-                                output_hidden_states=False,
-                                return_dict=True
-                            )
-                            # Assuming SigLIP-like output, discard CLS token embedding
-                            patch_embeddings = vision_outputs.last_hidden_state[:, 1:, :]
-                        except Exception as e:
-                            logger.error(f"Error getting vision embeddings: {e}", exc_info=True)
-                            continue # Skip batch on error
-
-                    # === Project Visual Features ===
-                    # This is the part being trained
-                    projected_embeds = self.projection_layer(patch_embeddings)
-
-                    # === Prepare LLM Inputs ===
-                    with torch.no_grad(): # Ensure no gradients for LLM embedding layer
-                         # Handle DDP wrapping
-                        if self.accelerator.num_processes > 1 and hasattr(self.language_model, 'module'):
-                           word_embeddings_module = self.language_model.module.get_input_embeddings()
+                # === Get Visual Features ===
+                with torch.no_grad(): # Ensure no gradients for vision encoder
+                    vision_dtype = next(self.vision_encoder.parameters()).dtype
+                    try:
+                        # Handle DDP wrapping
+                        if self.accelerator.num_processes > 1 and hasattr(self.vision_encoder, 'module'):
+                            vision_tower = self.vision_encoder.module.vision_model
                         else:
-                           word_embeddings_module = self.language_model.get_input_embeddings()
+                            vision_tower = self.vision_encoder.vision_model
 
-                        # --- Get embeddings using original token_ids (MUST be non-negative) --- 
-                        label_embeds = word_embeddings_module(token_ids) # Shape: [B, SeqLen_Text, Dim_LLM]
+                        vision_outputs = vision_tower(
+                            pixel_values=pixel_values.to(vision_dtype),
+                            output_hidden_states=False,
+                            return_dict=True
+                        )
+                        # Assuming SigLIP-like output, discard CLS token embedding
+                        patch_embeddings = vision_outputs.last_hidden_state[:, 1:, :]
+                    except Exception as e:
+                        logger.error(f"Error getting vision embeddings: {e}", exc_info=True)
+                        continue # Skip batch on error
 
-                    # Concatenate projected visual embeddings and target caption embeddings
-                    # Shape: [B, SeqLen_Vision + SeqLen_Text, Dim_LLM]
-                    combined_embeds = torch.cat([projected_embeds, label_embeds], dim=1)
+                # === Project Visual Features ===
+                # This is the part being trained
+                projected_embeds = self.projection_layer(patch_embeddings)
 
-                    # === Prepare Labels and Attention Mask for LLM ===
-                    num_visual_tokens = projected_embeds.size(1)
+                # === Prepare LLM Inputs ===
+                with torch.no_grad(): # Ensure no gradients for LLM embedding layer
+                     # Handle DDP wrapping
+                    if self.accelerator.num_processes > 1 and hasattr(self.language_model, 'module'):
+                       word_embeddings_module = self.language_model.module.get_input_embeddings()
+                    else:
+                       word_embeddings_module = self.language_model.get_input_embeddings()
 
-                    # Attention mask: 1s for visual tokens, 1s for non-padding caption tokens, 0s for padding
-                    visual_attention_mask = torch.ones(
-                        (labels.shape[0], num_visual_tokens),
-                        dtype=torch.long, device=self.device
-                    )
-                    # Mask for text tokens (1 if not padding, 0 if padding)
-                    # Use token_ids here as labels might have -100 where pad token was
-                    text_attention_mask = (token_ids != self.tokenizer.pad_token_id).long()
-                    if self.tokenizer.pad_token_id is None: # Handle cases without explicit pad token
-                         text_attention_mask = torch.ones_like(token_ids, dtype=torch.long, device=self.device)
+                    # --- Get embeddings using original token_ids (MUST be non-negative) --- 
+                    label_embeds = word_embeddings_module(token_ids) # Shape: [B, SeqLen_Text, Dim_LLM]
 
-                    # Combine masks: [B, SeqLen_Vision + SeqLen_Text]
-                    extended_attention_mask = torch.cat([visual_attention_mask, text_attention_mask], dim=1)
+                # Concatenate projected visual embeddings and target caption embeddings
+                # Shape: [B, SeqLen_Vision + SeqLen_Text, Dim_LLM]
+                combined_embeds = torch.cat([projected_embeds, label_embeds], dim=1)
 
-                    # Labels for LM loss: -100 for visual tokens, actual token IDs for caption tokens
-                    visual_labels = torch.full(
-                         (labels.shape[0], num_visual_tokens), fill_value=-100, dtype=labels.dtype, device=self.device
-                    )
-                    # Combine labels: [B, SeqLen_Vision + SeqLen_Text]
-                    # Use the 'labels' tensor which already has -100 for padding
-                    lm_labels = torch.cat([visual_labels, labels], dim=1)
+                # === Prepare Labels and Attention Mask for LLM ===
+                num_visual_tokens = projected_embeds.size(1)
+
+                # Attention mask: 1s for visual tokens, 1s for non-padding caption tokens, 0s for padding
+                visual_attention_mask = torch.ones(
+                    (labels.shape[0], num_visual_tokens),
+                    dtype=torch.long, device=self.device
+                )
+                # Mask for text tokens (1 if not padding, 0 if padding)
+                # Use token_ids here as labels might have -100 where pad token was
+                text_attention_mask = (token_ids != self.tokenizer.pad_token_id).long()
+                if self.tokenizer.pad_token_id is None: # Handle cases without explicit pad token
+                     text_attention_mask = torch.ones_like(token_ids, dtype=torch.long, device=self.device)
+
+                # Combine masks: [B, SeqLen_Vision + SeqLen_Text]
+                extended_attention_mask = torch.cat([visual_attention_mask, text_attention_mask], dim=1)
+
+                # Labels for LM loss: -100 for visual tokens, actual token IDs for caption tokens
+                visual_labels = torch.full(
+                     (labels.shape[0], num_visual_tokens), fill_value=-100, dtype=labels.dtype, device=self.device
+                )
+                # Combine labels: [B, SeqLen_Vision + SeqLen_Text]
+                # Use the 'labels' tensor which already has -100 for padding
+                lm_labels = torch.cat([visual_labels, labels], dim=1)
 
 
-                    # === Forward Pass through Frozen LLM ===
-                    # Calculate loss for predicting caption tokens based on visual input
-                    # Gradients will only flow back to the projector layer
-                    outputs = self.language_model(
-                        inputs_embeds=combined_embeds,
-                        attention_mask=extended_attention_mask,
-                        labels=lm_labels, # Use the combined labels with -100 for visual tokens
-                        return_dict=True,
-                        output_hidden_states=False
-                    )
-                    loss = outputs.loss # This is the causal LM loss
+                # === Forward Pass through Frozen LLM ===
+                # Calculate loss for predicting caption tokens based on visual input
+                # Gradients will only flow back to the projector layer
+                outputs = self.language_model(
+                    inputs_embeds=combined_embeds,
+                    attention_mask=extended_attention_mask,
+                    labels=lm_labels, # Use the combined labels with -100 for visual tokens
+                    return_dict=True,
+                    output_hidden_states=False
+                )
+                loss = outputs.loss # This is the causal LM loss
 
-                    # --- Backpropagation (updates only projector) ---
-                    scaled_loss = loss / self.accelerator.gradient_accumulation_steps
-                    self.accelerator.backward(scaled_loss)
+                # --- Backpropagation (updates only projector) ---
+                scaled_loss = loss / self.accelerator.gradient_accumulation_steps
+                self.accelerator.backward(scaled_loss)
 
-                    # --- Optimizer Step ---
-                    if self.accelerator.sync_gradients:
-                        # Optional gradient clipping (uncomment if needed)
-                        # TODO: Experiment with gradient clipping if training becomes unstable.
-                        self.accelerator.clip_grad_norm_(self.projection_layer.parameters(), 5.0) # Enabled gradient clipping
-                        self.optimizer.step()
-                        self.lr_scheduler.step()
-                        self.optimizer.zero_grad()
-                        global_step += 1
-                        
-                        # --- Accumulate loss ONLY on optimizer steps ---
-                        # Gather loss across all GPUs for the batches contributing to this step
-                        # Note: We still use the 'loss' from the last micro-batch for logging simplicity,
-                        #       a more precise average would require storing/averaging losses over accumulation steps.
-                        avg_loss_step = self.accelerator.gather(loss).mean().item() 
-                        epoch_train_loss += avg_loss_step
+                # --- Optimizer Step ---
+                if self.accelerator.sync_gradients:
+                    # Optional gradient clipping (uncomment if needed)
+                    # TODO: Experiment with gradient clipping if training becomes unstable.
+                    self.accelerator.clip_grad_norm_(self.projection_layer.parameters(), 5.0) # Enabled gradient clipping
+                    self.optimizer.step()
+                    self.lr_scheduler.step()
+                    self.optimizer.zero_grad()
+                    global_step += 1
+                    
+                    # --- Accumulate loss ONLY on optimizer steps ---
+                    # Gather loss across all GPUs for the batches contributing to this step
+                    # Note: We still use the 'loss' from the last micro-batch for logging simplicity,
+                    #       a more precise average would require storing/averaging losses over accumulation steps.
+                    avg_loss_step = self.accelerator.gather(loss).mean().item() 
+                    epoch_train_loss += avg_loss_step
 
                 # --- Logging and Metric Accumulation (Log status after each micro-batch) ---
                 # Gather loss across all GPUs for the current micro-batch for logging purposes

@@ -137,7 +137,9 @@ def main():
         torch_dtype=model_dtype,
         low_cpu_mem_usage=True
     )
-    logger.info(f"Loaded language model: {args.llm_name}")
+    # Enable gradient checkpointing to save memory on the frozen LLM
+    llm_model.gradient_checkpointing_enable()
+    logger.info(f"Loaded language model: {args.llm_name} and enabled gradient checkpointing.")
 
     # Handle padding token for tokenizer and model
     if llm_tokenizer.pad_token is None:
