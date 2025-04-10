@@ -28,7 +28,7 @@ def vqa_collate_fn(batch, pad_token_id):
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
 
     # Pad question_input_ids
-    question_input_ids_list = [item["question_input_ids"] for item in batch]
+    question_input_ids_list = [torch.tensor(item["question_input_ids"], dtype=torch.long) for item in batch]
     question_input_ids_padded = pad_sequence(
         question_input_ids_list,
         batch_first=True,
@@ -36,7 +36,7 @@ def vqa_collate_fn(batch, pad_token_id):
     )
 
     # Pad answer_input_ids
-    answer_input_ids_list = [item["answer_input_ids"] for item in batch]
+    answer_input_ids_list = [torch.tensor(item["answer_input_ids"], dtype=torch.long) for item in batch]
     answer_input_ids_padded = pad_sequence(
         answer_input_ids_list,
         batch_first=True,
