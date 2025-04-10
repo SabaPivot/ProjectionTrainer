@@ -4,25 +4,12 @@ import os
 import torch
 import logging
 import argparse
-import json
 from PIL import Image
 from transformers import AutoProcessor, AutoModel, AutoTokenizer
 from transformers import Gemma3ForCausalLM
 from safetensors.torch import load_file
 import sys
-
-# --- Add parent directory for imports ---
-script_dir = os.path.dirname(__file__)
-parent_dir = os.path.dirname(script_dir)
-if parent_dir not in sys.path:
-    sys.path.append(parent_dir)
-
-# Assuming projectors.py is in the parent directory (Siglip/)
-try:
-    from projectors import MLPProjector
-except ImportError:
-    print("Error: Could not import MLPProjector. Ensure projectors.py is in the parent directory (Siglip/).")
-    sys.exit(1)
+from Stage1.projectors import MLPProjector
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,7 +20,6 @@ def run_inference(args):
 
     # --- Determine Device and Dtype ---
     device = torch.device(args.device) # Use device from argument
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Determine dtype based on selected device capabilities
     if device.type == 'cuda' and torch.cuda.is_bf16_supported():
         model_dtype = torch.bfloat16
@@ -207,26 +193,9 @@ def run_inference(args):
         logger.info("Generation complete.")
 
         # --- Decode and Print ---
-        # outputs contain the full sequence (input + generated)
-        # We need to decode only the generated part
-        input_token_len = question_tokens.shape[1] # Length of original question tokens
-        # Note: generate() output includes prompt tokens when using inputs_embeds IF they are part of the model's standard input processing.
-        # However, when ONLY inputs_embeds are provided, the output usually starts right after. Let's assume the output only contains the *newly* generated tokens beyond the input.
-        # A safer way is often to decode the whole sequence and slice off the prompt if needed, but generate with inputs_embeds sometimes behaves differently.
-        # Let's decode the whole output first and see.
-
-        full_decoded_text = llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        # If using inputs_embeds, the `outputs` tensor often *only* contains the generated token IDs.
-        # If it contains the input tokens as well, we need to slice.
-        # Let's try decoding directly first. If it includes the prompt, we adjust.
         generated_text = llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # A common pattern is that generate output WITH inputs_embeds may still include the prompt.
-        # Let's try slicing based on the combined visual+question embedding length conceptually.
-        # This is tricky. The most robust way is usually passing `input_ids` not `inputs_embeds`.
-        # Let's stick to the simpler decoding for now.
-
+        
         print("\\n" + "="*30)
         print("      VQA Inference Result")
         print("="*30)
