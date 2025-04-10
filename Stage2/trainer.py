@@ -74,6 +74,7 @@ class VQATrainerStage2:
         freeze_vision_encoder: bool,
         freeze_projection_layer: bool,
         freeze_llm: bool,
+        train_ve_first_epoch: bool,
         wandb_project: str
     ):
         self.accelerator = accelerator
@@ -86,6 +87,7 @@ class VQATrainerStage2:
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.wandb_project = wandb_project
+        self.train_ve_first_epoch = train_ve_first_epoch
 
         if self.accelerator.is_main_process:
             os.makedirs(output_dir, exist_ok=True)
@@ -196,11 +198,30 @@ class VQATrainerStage2:
             self.projection_layer.train(mode=is_proj_trainable)
 
             ve_unwrapped = self.accelerator.unwrap_model(self.vision_encoder)
-            is_ve_trainable = any(p.requires_grad for p in ve_unwrapped.parameters())
-            if not is_ve_trainable:
-                self.vision_encoder.eval()
-            else:
+
+            # --- Dynamic Vision Encoder Freezing --- #
+            # Train VE only during the first epoch, freeze afterwards, following CheXagent paper
+            is_first_epoch = (epoch == 0)
+            should_attempt_ve_train = self.train_ve_first_epoch and is_first_epoch
+            # Check if VE params are actually in the optimizer (depends on initial freeze_vision_encoder flag)
+            ve_params_in_optimizer = any(id(p) in {id(opt_p) for opt_p in self.optimizer.param_groups[0]["params"]} for p in ve_unwrapped.parameters())
+            
+            if should_attempt_ve_train and ve_params_in_optimizer:
+                logger.info(f"Epoch {epoch+1}: Unfreezing Vision Encoder.")
+                self.vision_encoder.requires_grad_(True)
                 self.vision_encoder.train()
+            else:
+                # Log state change or reason for not training VE
+                if is_first_epoch and not self.train_ve_first_epoch:
+                    logger.info(f"Epoch {epoch+1}: --train_ve_first_epoch=False. Keeping Vision Encoder frozen.")
+                elif is_first_epoch and not ve_params_in_optimizer:
+                    logger.warning(f"Epoch {epoch+1}: Cannot unfreeze Vision Encoder - parameters not found in optimizer (was freeze_vision_encoder=True initially?). Keeping frozen.")
+                elif epoch == 1 and ve_params_in_optimizer and self.train_ve_first_epoch: # Log only once when freezing happens after first epoch
+                    logger.info(f"Epoch {epoch+1}: Freezing Vision Encoder for subsequent epochs.")
+                    
+                self.vision_encoder.requires_grad_(False)
+                self.vision_encoder.eval()
+            # ----------------------------------------- #
 
             epoch_train_loss = 0.0
 
@@ -222,8 +243,9 @@ class VQATrainerStage2:
                     question_input_ids = batch["question_input_ids"] # Unpadded question tokens
                     answer_input_ids = batch["answer_input_ids"] # Padded answer tokens
 
-                    # === Get Visual Features (Frozen Vision Encoder) ===
-                    with torch.no_grad(): # Ensure no gradients unless VE is fine-tuned
+                    # === Get Visual Features (Vision Encoder: Trainable only on epoch 1) ===
+                    # Use torch.set_grad_enabled for conditional gradient computation
+                    with torch.set_grad_enabled(self.vision_encoder.training):
                         vision_dtype = next(self.vision_encoder.parameters()).dtype
                         # Handle DDP wrapping
                         if hasattr(self.vision_encoder, 'module'):
@@ -290,7 +312,7 @@ class VQATrainerStage2:
                     # --- Attention Mask --- #
                     # Mask: 1 for visual, 1 for question, 1 for non-pad answer, 0 for pad answer
                     visual_attn_mask = torch.ones((batch_size, num_visual_tokens), dtype=torch.long, device=self.device)
-                    # Question mask depends on padding (now dynamically padded)
+                    # Question mask depends on padding (dynamically padded)
                     question_attn_mask = (question_input_ids != self.tokenizer.pad_token_id).long()
                     # Answer mask depends on padding
                     answer_attn_mask = (answer_input_ids != self.tokenizer.pad_token_id).long()
@@ -384,12 +406,7 @@ class VQATrainerStage2:
                  }
                 self.accelerator.log(epoch_log_dict, step=global_step)
 
-            # --- Validation Step (Optional but Recommended) --- #
-            # Add a validation loop here similar to Stage 1 if you have a validation set
-            # Remember to set models to eval mode and use torch.no_grad()
-            # Generate answers for validation questions and potentially compute metrics (e.g., BLEU, ROUGE)
             if self.accelerator.is_main_process:
-                 # Basic saving strategy: save every N epochs and at the end
                  if (epoch + 1) % 2 == 0 or (epoch + 1) == self.num_epochs: # Save every 2 epochs and final
                      save_path = os.path.join(self.output_dir, f"checkpoint-epoch_{epoch+1}")
                      self.save_model(save_path)
