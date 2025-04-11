@@ -5,6 +5,12 @@ import argparse
 import json
 from transformers import AutoProcessor, AutoModel, AutoTokenizer, Gemma3ForCausalLM
 from safetensors.torch import load_file
+import sys
+# --- Add parent directory to sys.path ---
+script_dir = os.path.dirname(__file__)
+parent_dir = os.path.dirname(script_dir)
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
 
 from Stage2.dataset import XrayVQADataset
 from Stage2.trainer import VQATrainerStage2

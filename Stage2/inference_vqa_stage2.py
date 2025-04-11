@@ -9,6 +9,11 @@ from transformers import AutoProcessor, AutoModel, AutoTokenizer
 from transformers import Gemma3ForCausalLM
 from safetensors.torch import load_file
 import sys
+# --- Add parent directory to sys.path ---
+script_dir = os.path.dirname(__file__)
+parent_dir = os.path.dirname(script_dir)
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
 from Stage1.projectors import MLPProjector
 
 # --- Setup Logging ---
