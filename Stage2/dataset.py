@@ -96,8 +96,8 @@ class XrayVQADataset(Dataset):
 
             return {
                 "pixel_values": pixel_values,
-                "question_input_ids": question_tokens, # A list of token IDs
-                "answer_input_ids": answer_tokens, # A list of token IDs
+                "question_input_ids": torch.tensor(question_tokens, dtype=torch.long),
+                "answer_input_ids": torch.tensor(answer_tokens, dtype=torch.long),
             }
 
         except FileNotFoundError:
