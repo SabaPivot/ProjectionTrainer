@@ -9,6 +9,7 @@ from transformers import AutoProcessor, AutoModel, AutoTokenizer
 from transformers import Gemma3ForCausalLM
 from safetensors.torch import load_file
 import sys
+import json
 # --- Add parent directory to sys.path ---
 script_dir = os.path.dirname(__file__)
 parent_dir = os.path.dirname(script_dir)
@@ -209,19 +210,84 @@ def run_inference(args):
         print(f"Answer:     {generated_text}")
         print("="*30)
 
+# Function to process a single sample
+def process_sample(sample, image_root, processor, vision_encoder, projection_layer, llm_tokenizer, llm_model, device, model_dtype, generation_args):
+    """Loads image, runs inference for one sample dict from JSON."""
+    try:
+        image_rel_path = sample.get("image")
+        question_text = sample.get("problem")
+        if not image_rel_path or not question_text:
+            logger.warning(f"Skipping sample due to missing 'image' or 'problem': {sample}")
+            return None
+
+        image_path = os.path.join(image_root, image_rel_path)
+
+        # --- Load and Preprocess Image ---
+        image = Image.open(image_path).convert('RGB')
+        img_size = processor.image_processor.size['height'] if 'height' in processor.image_processor.size else 384
+        image = image.resize((img_size, img_size))
+        image_inputs = processor(images=image, return_tensors="pt")
+        pixel_values = image_inputs.pixel_values.to(device, dtype=model_dtype)
+
+        # --- Tokenize Question ---
+        question_tokens = llm_tokenizer(
+            question_text,
+            return_tensors="pt",
+            add_special_tokens=False
+        ).input_ids.to(device)
+
+        # --- Generate Embeddings ---
+        with torch.no_grad():
+            vision_outputs = vision_encoder.vision_model(
+                pixel_values=pixel_values,
+                output_hidden_states=False,
+                return_dict=True
+            )
+            patch_embeddings = vision_outputs.last_hidden_state[:, 1:, :]
+            projected_embeds = projection_layer(patch_embeddings)
+            input_embed_layer = llm_model.get_input_embeddings()
+            question_embeds = input_embed_layer(question_tokens)
+            inputs_embeds = torch.cat([projected_embeds, question_embeds], dim=1)
+            batch_size, sequence_length, _ = inputs_embeds.shape
+            attention_mask = torch.ones(batch_size, sequence_length, dtype=torch.long, device=device)
+
+            # --- Generate Answer ---
+            outputs = llm_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                eos_token_id=llm_tokenizer.eos_token_id,
+                pad_token_id=llm_tokenizer.pad_token_id,
+                **generation_args # Pass generation kwargs dict
+            )
+
+            # --- Decode ---
+            generated_text = llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
+            return generated_text
+
+    except FileNotFoundError:
+        logger.error(f"Image file not found: {image_path}. Skipping sample.")
+        return None
+    except Exception as e:
+        logger.error(f"Error processing sample for image {image_path}: {e}", exc_info=True)
+        return None
+
+
+# --- Main Execution ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Stage 2 VQA Inference")
+    parser = argparse.ArgumentParser(description="Run Stage 2 VQA Inference on a JSON file")
 
     # --- Model Paths ---
     parser.add_argument("--vision_model_name", type=str, default="StanfordAIMI/XraySigLIP__vit-l-16-siglip-384__webli", help="Vision encoder name/path")
-    parser.add_argument("--llm_path", type=str, default="/mnt/samuel/Siglip/Stage2/trained_vqa_stage2/VQA_Stage2_VD_Class_20_lr2e-5_gemma3_vit-l-384-SFT:lr2e-5-epoch5/final_model/language_model/", help="Path to the fine-tuned LLM directory")
-    parser.add_argument("--projector_path", type=str, default="/mnt/samuel/Siglip/Stage2/trained_vqa_stage2/VQA_Stage2_VD_Class_20_lr2e-5_gemma3_vit-l-384-SFT:lr2e-5-epoch5/final_model/projection_layer/", help="Path to the trained projector directory (containing config and weights)")
+    parser.add_argument("--llm_path", type=str, required=True, help="Path to the fine-tuned LLM directory (must contain config.json)")
+    parser.add_argument("--projector_path", type=str, required=True, help="Path to the trained projector directory (containing config and weights)")
 
     # --- Input Data ---
-    parser.add_argument("--image_path", type=str, default="/mnt/data/CXR/NIH Chest X-rays_jpg/images_001/images/00000001_000.jpg", help="Path to the input image")
-    parser.add_argument("--question", type=str, default="Examine the chest X-ray and write a report discussing any abnormalities or notable features.", help="Question to ask about the image")
+    parser.add_argument("--input_json", type=str, required=True, help="Path to the input JSON file containing image/problem/normal_caption triplets")
+    parser.add_argument("--image_root", type=str, required=True, help="Root directory where images are located (paths in JSON are relative to this)")
+    # parser.add_argument("--image_path", type=str, default="/mnt/data/CXR/NIH Chest X-rays_jpg/images_001/images/00000001_000.jpg", help="Path to the input image") # Removed
+    # parser.add_argument("--question", type=str, default="Examine the chest X-ray and write a report discussing any abnormalities or notable features.", help="Question to ask about the image") # Removed
 
-    # --- Device --- #
+    # --- Device ---
     default_device = "cuda" if torch.cuda.is_available() else "cpu"
     parser.add_argument("--device", type=str, default=default_device, help=f"Device to use (e.g., cuda:0, cuda:1, cpu). Default: {default_device}")
 
@@ -244,9 +310,106 @@ if __name__ == "__main__":
     if not os.path.isdir(args.projector_path):
         logger.error(f"Projector path not found: {args.projector_path}")
         sys.exit(1)
-    if not os.path.exists(args.image_path):
-        logger.error(f"Image path not found: {args.image_path}")
+    if not os.path.exists(args.input_json):
+        logger.error(f"Input JSON file not found: {args.input_json}")
+        sys.exit(1)
+    if not os.path.isdir(args.image_root):
+        logger.error(f"Image root directory not found: {args.image_root}")
         sys.exit(1)
 
+    # --- Setup Device and Dtype ---
+    device = torch.device(args.device)
+    if device.type == 'cuda' and torch.cuda.is_bf16_supported():
+        model_dtype = torch.bfloat16
+    elif device.type == 'cuda':
+        model_dtype = torch.float16
+    else:
+        model_dtype = torch.float32
+    logger.info(f"Using device: {device}")
+    logger.info(f"Using model dtype: {model_dtype}")
 
-    run_inference(args)
+    # --- Load Models and Processor ONCE ---
+    logger.info("Loading models and processor...")
+    try:
+        processor = AutoProcessor.from_pretrained(args.vision_model_name)
+        vision_encoder = AutoModel.from_pretrained(
+            args.vision_model_name, torch_dtype=model_dtype, low_cpu_mem_usage=True
+        ).to(device).eval()
+        vision_dim = vision_encoder.config.vision_config.hidden_size
+
+        llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_path)
+        if llm_tokenizer.pad_token is None:
+            llm_tokenizer.pad_token = llm_tokenizer.eos_token
+        llm_config_path = os.path.join(args.llm_path, "config.json")
+        if not os.path.exists(llm_config_path):
+             logger.error(f"Critical Error: 'config.json' not found in {args.llm_path}")
+             sys.exit(1)
+        llm_model = Gemma3ForCausalLM.from_pretrained(
+            args.llm_path, torch_dtype=model_dtype, low_cpu_mem_usage=True, attn_implementation="eager"
+        ).to(device).eval()
+        llm_dim = llm_model.config.hidden_size
+
+        projection_layer = MLPProjector(vision_dim=vision_dim, llm_dim=llm_dim)
+        projector_weights_path = os.path.join(args.projector_path, "model.safetensors")
+        if not os.path.exists(projector_weights_path):
+             raise FileNotFoundError(f"Projector weights not found at {projector_weights_path}")
+        proj_state_dict = load_file(projector_weights_path, device="cpu")
+        projection_layer.load_state_dict(proj_state_dict)
+        projection_layer = projection_layer.to(device, dtype=model_dtype).eval()
+        logger.info("Models loaded successfully.")
+
+    except Exception as e:
+        logger.error(f"Failed to load models: {e}", exc_info=True)
+        sys.exit(1)
+
+    # --- Load JSON Data ---
+    try:
+        with open(args.input_json, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        logger.info(f"Loaded {len(data)} samples from {args.input_json}")
+    except Exception as e:
+        logger.error(f"Failed to load or parse JSON file {args.input_json}: {e}")
+        sys.exit(1)
+
+    # --- Prepare Generation Arguments ---
+    generation_args = {
+        "max_new_tokens": args.max_new_tokens,
+        "do_sample": args.do_sample,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "repetition_penalty": args.repetition_penalty,
+        "length_penalty": args.length_penalty,
+        "num_beams": args.num_beams,
+    }
+
+    # --- Process Each Sample ---
+    logger.info("Starting inference loop...")
+    for i, sample in enumerate(data):
+        logger.info(f"Processing sample {i+1}/{len(data)}...")
+        prediction = process_sample(
+            sample=sample,
+            image_root=args.image_root,
+            processor=processor,
+            vision_encoder=vision_encoder,
+            projection_layer=projection_layer,
+            llm_tokenizer=llm_tokenizer,
+            llm_model=llm_model,
+            device=device,
+            model_dtype=model_dtype,
+            generation_args=generation_args
+        )
+
+        if prediction is not None:
+            image_rel_path = sample.get("image")
+            question = sample.get("problem")
+            ground_truth = sample.get("normal_caption", "N/A") # Handle missing ground truth
+
+            print("\n" + "="*30 + f" Sample {i+1} " + "="*30)
+            print(f"Image Path: {os.path.join(args.image_root, image_rel_path)}")
+            print(f"Question:   {question}")
+            print(f"Prediction: {prediction}")
+            print(f"Answer:     {ground_truth}")
+            print("="*70)
+
+    logger.info("Inference loop finished.")
