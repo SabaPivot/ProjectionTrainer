@@ -48,6 +48,9 @@ def load_image_from_json(json_file: str, image_root: str) -> List[Tuple[Optional
             return []
         
         print(f"Found {len(data)} entries in JSON file")
+        print("Example normal_caption values:")
+        
+        caption_examples_shown = 0
         for i, item in enumerate(data):
             if 'image' not in item:
                 print(f"Skipping entry {i}: No 'image' field found")
@@ -58,8 +61,10 @@ def load_image_from_json(json_file: str, image_root: str) -> List[Tuple[Optional
             
             # Extract normal_caption if available
             normal_caption = item.get('normal_caption', '')
-            if normal_caption and i < 2:  # Only print first 2 to reduce output
-                print(f"Entry {i} has normal_caption: {normal_caption[:50]}..." if len(normal_caption) > 50 else normal_caption)
+            if normal_caption and caption_examples_shown < 2:
+                formatted_caption = normal_caption[:50] + "..." if len(normal_caption) > 50 else normal_caption
+                print(f"  Entry {i}: \"{formatted_caption}\"")
+                caption_examples_shown += 1
             
             # Check if image exists
             if not os.path.exists(image_path):
