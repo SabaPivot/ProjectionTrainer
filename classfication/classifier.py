@@ -7,7 +7,8 @@ from utils import (
     get_candidate_labels,
     process_image,
     display_results,
-    display_summary
+    display_summary,
+    extract_ground_truth_labels
 )
 
 def main():
@@ -29,14 +30,20 @@ def main():
     target_labels = candidate_labels  # Using all candidate labels as targets
     print(f"Using labels for classification: {', '.join(target_labels)}")
     
+    print(f"Processing {len(images_data)} images...")
+    
     # Process all images
     all_results = []
     for i, (image, image_path, metadata) in enumerate(images_data):
         if image is None:
-            print(f"Skipping image {i+1}/{len(images_data)}: Could not load")
+            if args.verbose:
+                print(f"Skipping image {i+1}/{len(images_data)}: Could not load")
             continue
         
-        print(f"\nProcessing image {i+1}/{len(images_data)}: {os.path.basename(image_path)}")
+        if args.verbose:
+            print(f"\nProcessing image {i+1}/{len(images_data)}: {os.path.basename(image_path)}")
+        elif (i+1) % 10 == 0 or i+1 == len(images_data):
+            print(f"Progress: {i+1}/{len(images_data)} images processed", end="\r")
         
         # Process the image
         results = process_image(image, candidate_labels, processor, model, device)
@@ -44,32 +51,33 @@ def main():
         # Get normal_caption if available
         normal_caption = metadata.get('normal_caption', '')
         
-        # Display individual results
-        display_results(results, image_path, normal_caption)
+        # Display individual results (if verbose)
+        display_results(results, image_path, normal_caption, args.verbose)
         
-        # Extract ground truth labels from normal_caption
-        ground_truth_labels = []
-        if normal_caption:
-            # Look for each target label in the normal_caption
-            for label in target_labels:
-                if label.lower() in normal_caption.lower():
-                    ground_truth_labels.append(label)
-            
-            if ground_truth_labels:
-                print(f"Found ground truth labels in caption: {', '.join(ground_truth_labels)}")
+        # Extract ground truth labels from normal_caption using comma separation
+        ground_truth_labels = extract_ground_truth_labels(normal_caption)
+        
+        if args.verbose and ground_truth_labels:
+            print(f"Ground truth labels from caption: {', '.join(ground_truth_labels)}")
         
         # Store results for summary
         top_prediction = results[0]['label']
+        
+        # Check if prediction is correct (appears in comma-separated normal_caption)
+        is_correct = top_prediction in ground_truth_labels if ground_truth_labels else False
+        
         result_entry = {
             'image_path': image_path,
             'prediction': top_prediction,
             'probability': results[0]['probability'],
             'ground_truth': normal_caption if normal_caption else None,
             'ground_truth_labels': ground_truth_labels,
-            'correct': top_prediction in ground_truth_labels if ground_truth_labels else top_prediction in target_labels,
+            'correct': is_correct,
             'metadata': metadata
         }
         all_results.append(result_entry)
+    
+    print("\n") # Clear progress line
     
     # Display summary of all results
     if all_results:
@@ -80,8 +88,7 @@ def main():
         total_count = len(all_results)
         accuracy = (correct_count / total_count) * 100 if total_count > 0 else 0
         
-        print(f"\nClassification Results:")
-        print(f"Correct predictions: {correct_count}/{total_count} ({accuracy:.2f}%)")
+        print(f"\nFINAL CLASSIFICATION ACCURACY: {correct_count}/{total_count} ({accuracy:.2f}%)")
 
 if __name__ == "__main__":
     main()

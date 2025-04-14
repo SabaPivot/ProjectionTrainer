@@ -11,6 +11,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Classify X-ray images with SigLIP")
     parser.add_argument("--image_root", type=str, required=True, help="Root directory containing images")
     parser.add_argument("--json_file", type=str, required=True, help="JSON file containing image filenames")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed results for each image")
     return parser.parse_args()
 
 def setup_device():
@@ -57,10 +58,8 @@ def load_image_from_json(json_file: str, image_root: str) -> List[Tuple[Optional
             
             # Extract normal_caption if available
             normal_caption = item.get('normal_caption', '')
-            if normal_caption:
+            if normal_caption and i < 2:  # Only print first 2 to reduce output
                 print(f"Entry {i} has normal_caption: {normal_caption[:50]}..." if len(normal_caption) > 50 else normal_caption)
-            else:
-                print(f"Entry {i} has no normal_caption")
             
             # Check if image exists
             if not os.path.exists(image_path):
@@ -83,6 +82,22 @@ def load_image_from_json(json_file: str, image_root: str) -> List[Tuple[Optional
         print(f"With normal_caption: {sum(1 for _, _, meta in images_data if 'normal_caption' in meta)}")
         
     return images_data
+
+def extract_ground_truth_labels(normal_caption: str) -> List[str]:
+    """
+    Extract ground truth labels from normal_caption by splitting on commas.
+    
+    Args:
+        normal_caption: The caption string containing labels separated by commas
+        
+    Returns:
+        List of labels extracted from the caption
+    """
+    if not normal_caption:
+        return []
+        
+    # Split by comma and strip whitespace
+    return [label.strip() for label in normal_caption.split(", ")]
 
 def get_candidate_labels() -> List[str]:
     """Return the list of candidate X-ray pathology labels."""
@@ -126,8 +141,11 @@ def process_image(image, candidate_labels, processor, model, device):
     results = sorted(results, key=lambda x: x["probability"], reverse=True)
     return results
 
-def display_results(results: List[Dict], image_path: str = None, normal_caption: str = None) -> None:
+def display_results(results: List[Dict], image_path: str = None, normal_caption: str = None, verbose: bool = False) -> None:
     """Display classification results in a formatted table for a single image."""
+    if not verbose:
+        return
+        
     if image_path:
         print(f"\nClassification Results for {os.path.basename(image_path)}:")
     else:
@@ -152,6 +170,11 @@ def display_summary(all_results: List[Dict[str, Any]], target_labels: List[str])
     print("="*60)
     
     total = len(all_results)
+    if total == 0:
+        print("No results to display")
+        return
+        
+    # Count predictions matching each target label
     correct = sum(1 for r in all_results if r['prediction'] in target_labels)
     
     print(f"Total images processed: {total}")
@@ -161,7 +184,7 @@ def display_summary(all_results: List[Dict[str, Any]], target_labels: List[str])
     has_ground_truth = sum(1 for r in all_results if r.get('ground_truth'))
     if has_ground_truth:
         print(f"\nImages with ground truth labels: {has_ground_truth}")
-        matches = sum(1 for r in all_results if r.get('ground_truth') and r['prediction'] in r.get('ground_truth_labels', []))
+        matches = sum(1 for r in all_results if r.get('correct', False))
         print(f"Predictions matching ground truth: {matches} ({matches/has_ground_truth*100:.2f}%)")
     
     # Display distribution of top predictions
