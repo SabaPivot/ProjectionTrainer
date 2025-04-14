@@ -200,6 +200,36 @@ def display_summary(all_results: List[Dict[str, Any]], target_labels: List[str])
         print(f"\nImages with ground truth labels: {has_ground_truth}")
         matches = sum(1 for r in all_results if r.get('correct', False))
         print(f"Predictions matching ground truth: {matches} ({matches/has_ground_truth*100:.2f}%)")
+        
+        # Calculate per-class accuracy statistics
+        print("\nClassification Accuracy distribution:")
+        per_class_stats = {}
+        
+        # Initialize counts for each target label
+        for label in target_labels:
+            per_class_stats[label] = {"total": 0, "correct": 0}
+        
+        # Count occurrences and correct predictions for each class
+        for result in all_results:
+            if not result.get('ground_truth_labels'):
+                continue
+                
+            # For each class in this image's ground truth
+            for gt_label in result['ground_truth_labels']:
+                if gt_label in target_labels:
+                    per_class_stats[gt_label]["total"] += 1
+                    
+                    # If prediction matches this specific class
+                    if result['prediction'] == gt_label:
+                        per_class_stats[gt_label]["correct"] += 1
+        
+        # Display per-class accuracy
+        for label, stats in sorted(per_class_stats.items()):
+            if stats["total"] > 0:
+                accuracy = (stats["correct"] / stats["total"]) * 100
+                print(f"  {label:<20}: {stats['correct']}/{stats['total']} ({accuracy:.2f}%)")
+            else:
+                print(f"  {label:<20}: 0/0 (0.00%)")
     
     # Display distribution of top predictions
     prediction_counts = {}
