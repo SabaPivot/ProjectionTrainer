@@ -10,6 +10,7 @@ from transformers import get_cosine_schedule_with_warmup
 import json
 from torch.nn.utils.rnn import pad_sequence
 from functools import partial
+from accelerate.utils import gather_object
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ def vqa_collate_fn(batch, pad_token_id):
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
 
     # Pad question_input_ids
-    question_input_ids_list = [torch.tensor(item["question_input_ids"], dtype=torch.long) for item in batch]
+    question_input_ids_list = [item["question_input_ids"] for item in batch]
     question_input_ids_padded = pad_sequence(
         question_input_ids_list,
         batch_first=True,
@@ -36,7 +37,7 @@ def vqa_collate_fn(batch, pad_token_id):
     )
 
     # Pad answer_input_ids
-    answer_input_ids_list = [torch.tensor(item["answer_input_ids"], dtype=torch.long) for item in batch]
+    answer_input_ids_list = [item["answer_input_ids"] for item in batch]
     answer_input_ids_padded = pad_sequence(
         answer_input_ids_list,
         batch_first=True,
@@ -64,6 +65,7 @@ class VQATrainerStage2:
         projection_layer,
         tokenizer,
         train_dataset,
+        val_dataset,
         output_dir: str,
         batch_size: int,
         learning_rate: float,
@@ -88,6 +90,14 @@ class VQATrainerStage2:
         self.batch_size = batch_size
         self.wandb_project = wandb_project
         self.train_ve_first_epoch = train_ve_first_epoch
+        
+        # Define validation_dir for all processes
+        self.validation_dir = os.path.join(output_dir, "validation_examples")
+        
+        # Only main process creates the directory
+        if self.accelerator.is_main_process:
+            os.makedirs(self.validation_dir, exist_ok=True)
+            logger.info(f"Created validation directory at {self.validation_dir}")
 
         if self.accelerator.is_main_process:
             os.makedirs(output_dir, exist_ok=True)
@@ -100,6 +110,15 @@ class VQATrainerStage2:
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+            collate_fn=collate_fn_partial
+        )
+
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
             num_workers=4,
             pin_memory=True,
             collate_fn=collate_fn_partial
@@ -151,8 +170,8 @@ class VQATrainerStage2:
         if not freeze_vision_encoder:
              self.vision_encoder = self.accelerator.prepare(self.vision_encoder)
 
-        self.optimizer, self.train_loader, self.lr_scheduler = self.accelerator.prepare(
-            self.optimizer, self.train_loader, self.lr_scheduler
+        self.optimizer, self.train_loader, self.val_loader, self.lr_scheduler = self.accelerator.prepare(
+            self.optimizer, self.train_loader, self.val_loader, self.lr_scheduler
         )
 
     def _setup_trainable_parameters(self, freeze_vision_encoder: bool, freeze_projection_layer: bool, freeze_llm: bool) -> list:
@@ -394,18 +413,22 @@ class VQATrainerStage2:
                      progress_bar.set_postfix({"micro_loss": current_avg_micro_batch_loss, "lr": self.lr_scheduler.get_last_lr()[0]}) 
                      
 
-            # --- End of Epoch --- #
-            num_optimizer_steps_per_epoch = math.ceil(len(self.train_loader) / self.accelerator.gradient_accumulation_steps)
-            avg_epoch_train_loss = epoch_train_loss / num_optimizer_steps_per_epoch if num_optimizer_steps_per_epoch > 0 else 0.0
-
+            # Calculate and log epoch metrics 
+            avg_epoch_loss = epoch_train_loss / len(self.train_loader)
+            
+            # Log training loss
             if self.accelerator.is_main_process:
-                logger.info(f"Epoch {epoch+1}/{self.num_epochs} - Avg Train Loss: {avg_epoch_train_loss:.4f}")
-                epoch_log_dict = {
-                     "train/epoch_loss": avg_epoch_train_loss,
-                     "epoch": epoch + 1
-                 }
-                self.accelerator.log(epoch_log_dict, step=global_step)
+                logger.info(f"Epoch {epoch+1} Training Loss: {avg_epoch_loss:.4f}")
+                self.accelerator.log({
+                    "train/loss": avg_epoch_loss,
+                    "train/learning_rate": self.optimizer.param_groups[0]["lr"],
+                    "epoch": epoch + 1
+                }, step=global_step)
+            
+            # Run validation after each epoch
+            self.evaluate(epoch, global_step)
 
+            # --- Save Checkpoint --- #
             if self.accelerator.is_main_process:
                  if (epoch + 1) % 2 == 0 or (epoch + 1) == self.num_epochs: # Save every 2 epochs and final
                      save_path = os.path.join(self.output_dir, f"checkpoint-epoch_{epoch+1}")
@@ -418,6 +441,199 @@ class VQATrainerStage2:
             logger.info("Final Stage 2 model saved.")
 
         logger.info(f"Process {self.accelerator.process_index}: Stage 2 training complete!")
+
+    def evaluate(self, epoch, global_step):
+        """Runs evaluation on the validation set, calculates loss and saves examples to file.
+
+        Args:
+            epoch (int): Current epoch number.
+            global_step (int): Current global training step.
+        """
+        logger.info(f"Starting evaluation for Epoch {epoch+1}...")
+        self.language_model.eval()
+        self.projection_layer.eval()
+        self.vision_encoder.eval()
+
+        total_val_loss = 0.0
+
+        # For collecting validation examples
+        all_examples = []
+        max_examples_to_log = min(20, len(self.val_loader.dataset)) # Limit examples for performance
+
+        # Process entire validation set
+        with torch.no_grad():
+             for batch_idx, batch in enumerate(self.val_loader):
+                pixel_values = batch["pixel_values"]
+                question_input_ids = batch["question_input_ids"]
+                answer_input_ids = batch["answer_input_ids"]
+
+                # === Get Visual Features ===
+                vision_dtype = next(self.vision_encoder.parameters()).dtype
+                if hasattr(self.vision_encoder, 'module'):
+                    vision_tower = self.vision_encoder.module.vision_model
+                else:
+                    vision_tower = self.vision_encoder.vision_model
+                vision_outputs = vision_tower(
+                    pixel_values=pixel_values.to(vision_dtype),
+                    output_hidden_states=False,
+                    return_dict=True
+                )
+                patch_embeddings = vision_outputs.last_hidden_state[:, 1:, :]
+
+                # === Project Visual Features ===
+                projected_embeds = self.projection_layer(patch_embeddings)
+
+                # === Prepare LLM Inputs (Embeddings for Loss Calculation) ===
+                llm_model_unwrapped = self.accelerator.unwrap_model(self.language_model)
+                input_embed_layer = llm_model_unwrapped.get_input_embeddings()
+
+                if 'gemma3' in llm_model_unwrapped.__class__.__name__.lower():
+                    question_embeds = input_embed_layer.weight[question_input_ids]
+                    answer_embeds = input_embed_layer.weight[answer_input_ids]
+                    if hasattr(input_embed_layer, 'embed_scale'):
+                        embed_scale = input_embed_layer.embed_scale.clone().detach()
+                        question_embeds = question_embeds * embed_scale
+                        answer_embeds = answer_embeds * embed_scale
+                else:
+                    question_embeds = input_embed_layer(question_input_ids)
+                    answer_embeds = input_embed_layer(answer_input_ids)
+
+                inputs_embeds_for_loss = torch.cat([projected_embeds, question_embeds, answer_embeds], dim=1)
+
+                # === Prepare Labels and Attention Mask for Loss ===
+                batch_size = projected_embeds.shape[0]
+                num_visual_tokens = projected_embeds.shape[1]
+                q_len = question_input_ids.shape[1]
+
+                visual_attn_mask = torch.ones((batch_size, num_visual_tokens), dtype=torch.long, device=projected_embeds.device)
+                question_attn_mask = torch.ones((batch_size, q_len), dtype=torch.long, device=projected_embeds.device)
+                answer_attn_mask = (answer_input_ids != self.tokenizer.pad_token_id).long()
+                attention_mask_for_loss = torch.cat([visual_attn_mask, question_attn_mask, answer_attn_mask], dim=1)
+
+                # Labels: -100 for visual/question, token_id for answer (or -100 if padding)
+                visual_labels = torch.full((batch_size, num_visual_tokens), fill_value=-100, dtype=torch.long, device=projected_embeds.device)
+                question_labels = torch.full((batch_size, q_len), fill_value=-100, dtype=torch.long, device=projected_embeds.device)
+                answer_labels = answer_input_ids.clone()
+                answer_labels[answer_labels == self.tokenizer.pad_token_id] = -100
+                labels_for_loss = torch.cat([visual_labels, question_labels, answer_labels], dim=1)
+
+                # === Forward Pass for Loss ===
+                outputs_for_loss = self.language_model(
+                    inputs_embeds=inputs_embeds_for_loss,
+                    attention_mask=attention_mask_for_loss,
+                    return_dict=True
+                )
+                logits = outputs_for_loss.logits.to(torch.float32)
+                """
+                logits[..., :-1, :] removes the prediction for the last token position because there is no subsequent target label to compare it against.
+                labels_for_loss[..., 1:] removes the first target label because the model doesn't make a prediction before seeing the first token.
+                This ensures the prediction at time step t is compared against the actual label at time step t+1.
+                """
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels_for_loss[..., 1:].contiguous()
+                
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+                total_val_loss += self.accelerator.gather(loss).mean().item()
+
+                # Generate predictions
+                try:
+                    # Prepare inputs for generation (only visual + question)
+                    inputs_embeds_for_gen = torch.cat([projected_embeds, question_embeds], dim=1)
+                    attention_mask_for_gen = torch.cat([visual_attn_mask, question_attn_mask], dim=1)
+
+                    llm_model_unwrapped = self.accelerator.unwrap_model(self.language_model)
+                    generated_outputs = llm_model_unwrapped.generate(
+                        inputs_embeds=inputs_embeds_for_gen,
+                        attention_mask=attention_mask_for_gen,
+                        max_new_tokens=512,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        do_sample=True,
+                        num_beams=3,
+                        top_p=0.9,
+                        top_k=50
+                    )
+
+                    # Decode outputs
+                    decoded_preds = self.tokenizer.batch_decode(generated_outputs, skip_special_tokens=True)
+                    decoded_questions = self.tokenizer.batch_decode(question_input_ids, skip_special_tokens=True)
+                    answer_refs = answer_input_ids.clone()
+                    decoded_refs = self.tokenizer.batch_decode(answer_refs, skip_special_tokens=True)
+
+                    # Store examples from this batch for gathering
+                    batch_examples = []
+                    for j in range(len(decoded_preds)):
+                        batch_examples.append({
+                            "epoch": epoch + 1,
+                            "question": decoded_questions[j],
+                            "ground_truth": decoded_refs[j],
+                            "prediction": decoded_preds[j]
+                        })
+
+                    all_examples.extend(batch_examples)
+
+                except Exception as e:
+                    logger.error(f"Error during validation generation/logging: {e}", exc_info=True)
+
+        # Wait for all processes to finish validation loop
+        self.accelerator.wait_for_everyone()
+
+        # --- Gather examples using accelerator.gather_object ---
+        # Wrap the list in another list to potentially avoid incorrect flattening bug in gather_object
+        gathered_nested_list = gather_object([all_examples])
+
+        gathered_examples = []
+        if self.accelerator.is_main_process:
+            # Flatten the list of lists from each process
+            for process_list in gathered_nested_list:
+                 gathered_examples.extend(process_list)
+            gathered_examples = gathered_examples[:max_examples_to_log]
+
+        # Calculate Average Validation Loss
+        avg_val_loss = total_val_loss / len(self.val_loader)
+        log_metrics = {"val/loss": avg_val_loss, "epoch": epoch + 1}
+
+        # Log metrics and save examples
+        if self.accelerator.is_main_process:
+            logger.info(f"Epoch {epoch+1} Validation Loss: {avg_val_loss:.4f}")
+            self.accelerator.log(log_metrics, step=global_step)
+
+            if gathered_examples:
+                try:
+                    validation_file = os.path.join(self.validation_dir, f"epoch_{epoch+1}_examples.txt")
+                    with open(validation_file, 'w', encoding='utf-8') as f:
+                        f.write(f"Validation Examples for Epoch {epoch+1}\n")
+                        f.write(f"{'='*80}\n\n")
+                        for i, example in enumerate(gathered_examples):
+                            f.write(f"Example {i+1}:\n")
+                            f.write(f"Question: {example['question']}\n")
+                            f.write(f"Ground Truth: {example['ground_truth']}\n")
+                            f.write(f"Prediction: {example['prediction']}\n")
+                            f.write(f"{'='*80}\n\n")
+
+                    combined_file = os.path.join(self.validation_dir, "all_validation_examples.txt")
+                    mode = 'a' if epoch > 0 else 'w'
+                    with open(combined_file, mode, encoding='utf-8') as f:
+                        f.write(f"\nValidation Examples for Epoch {epoch+1}\n")
+                        f.write(f"{'='*80}\n\n")
+                        for i, example in enumerate(gathered_examples):
+                            f.write(f"Example {i+1}:\n")
+                            f.write(f"Question: {example['question']}\n")
+                            f.write(f"Ground Truth: {example['ground_truth']}\n")
+                            f.write(f"Prediction: {example['prediction']}\n")
+                            f.write(f"{'='*80}\n\n")
+
+                    logger.info(f"Saved {len(gathered_examples)} validation examples to {os.path.abspath(validation_file)}")
+                    logger.info(f"Updated combined validation examples file: {os.path.abspath(combined_file)}")
+                except Exception as e:
+                    logger.error(f"Failed to save validation examples to file: {e}", exc_info=True)
+
+        # Set models back to training mode if they were trainable
+        self.language_model.train(mode=any(p.requires_grad for p in self.accelerator.unwrap_model(self.language_model).parameters()))
+        self.projection_layer.train(mode=any(p.requires_grad for p in self.accelerator.unwrap_model(self.projection_layer).parameters()))
+        logger.info("Evaluation finished.")
 
     def save_model(self, path):
         """Saves the trainable components (LLM, Projector) (main process only)"""

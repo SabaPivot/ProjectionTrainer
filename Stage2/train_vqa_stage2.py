@@ -77,6 +77,7 @@ def main():
     # --- Data Arguments ---
     parser.add_argument("--image_root", type=str, required=True, help="Root directory with training images")
     parser.add_argument("--train_json", type=str, required=True, help="JSON file with training image-question-answer triplets")
+    parser.add_argument("--val_json", type=str, required=True, help="JSON file with validation image-question-answer triplets")
     parser.add_argument("--img_size", type=int, default=384, help="Image size")
     parser.add_argument("--max_q_len", type=int, default=128, help="Max token length for questions")
     parser.add_argument("--max_a_len", type=int, default=512, help="Max token length for answers")
@@ -170,7 +171,7 @@ def main():
         return
 
     # --- Create Dataset --- #
-    if accelerator.is_main_process: logger.info("Creating training dataset for Stage 2 VQA...")
+    if accelerator.is_main_process: logger.info("Creating training and validation datasets for Stage 2 VQA...")
     try:
         train_dataset = XrayVQADataset(
             image_root=args.image_root,
@@ -181,7 +182,17 @@ def main():
             max_q_len=args.max_q_len,
             max_a_len=args.max_a_len,
         )
-        logger.info(f"Loaded VQA dataset with {len(train_dataset)} samples.")
+        logger.info(f"Loaded Train dataset with {len(train_dataset)} samples.")
+        val_dataset = XrayVQADataset(
+            image_root=args.image_root,
+            json_file=args.val_json,
+            processor=processor,
+            tokenizer=llm_tokenizer,
+            img_size=args.img_size,
+            max_q_len=args.max_q_len,
+            max_a_len=args.max_a_len,
+        )
+        logger.info(f"Loaded Validation dataset with {len(val_dataset)} samples.")
     except Exception as e:
         logger.error(f"Failed to create dataset: {e}", exc_info=True)
         if accelerator.is_main_process and accelerator.trackers:
@@ -196,6 +207,7 @@ def main():
         projection_layer=projection_layer,
         tokenizer=llm_tokenizer,
         train_dataset=train_dataset,
+        val_dataset=val_dataset,
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
