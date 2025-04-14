@@ -4,6 +4,7 @@ from transformers import SiglipProcessor, SiglipModel
 import os
 import json
 import argparse
+from typing import List, Tuple, Dict, Optional, Any, Union
 
 def parse_args():
     """Parse command line arguments for X-ray classification."""
@@ -24,33 +25,56 @@ def load_model(model_name, device):
     model = SiglipModel.from_pretrained(model_name).to(device)
     return processor, model
 
-def load_image_from_json(json_file, image_root):
-    """Load image filename from JSON and return the loaded image."""
-    print(f"Loading image filenames from: {json_file}")
+def load_image_from_json(json_file: str, image_root: str) -> List[Tuple[Optional[Image.Image], str, Dict[str, Any]]]:
+    """
+    Load all image filenames from JSON and return a list of loaded images with metadata.
+    
+    Returns:
+        List of tuples, each containing (image object, image path, metadata dictionary)
+        If an image can't be loaded, image will be None for that entry
+    """
+    print(f"Loading images from: {json_file}")
+    images_data = []
+    
     with open(json_file, 'r') as f:
         data = json.load(f)
-        # Assuming JSON file has at least one entry with an 'image' key
-        if isinstance(data, list) and len(data) > 0 and 'image' in data[0]:
-            image_filename = data[0]['image']
-        else:
-            print("JSON file format not recognized. Please provide a valid file.")
-            return None, None
+        if not isinstance(data, list):
+            print("JSON file format not recognized. Expected a list of image entries.")
+            return []
+        
+        print(f"Found {len(data)} images in JSON file")
+        for i, item in enumerate(data):
+            if 'image' not in item:
+                print(f"Skipping entry {i}: No 'image' field found")
+                continue
+                
+            image_filename = item['image']
+            image_path = os.path.join(image_root, image_filename)
+            
+            # Check if image exists
+            if not os.path.exists(image_path):
+                print(f"Warning: Image not found at {image_path}")
+                images_data.append((None, image_path, item))
+                continue
+            
+            try:
+                # Load image from local path
+                image = Image.open(image_path).convert("RGB")
+                images_data.append((image, image_path, item))
+            except Exception as e:
+                print(f"Error loading image {image_path}: {str(e)}")
+                images_data.append((None, image_path, item))
     
-    # Create image path
-    image_path = os.path.join(image_root, image_filename)
-    
-    # Check if image exists
-    if not os.path.exists(image_path):
-        print(f"Error: Image not found at {image_path}")
-        return None, None
-    
-    # Load image from local path
-    print(f"Analyzing X-ray image: {image_path}")
-    image = Image.open(image_path).convert("RGB")
-    return image, image_path
+    if not images_data:
+        print("No valid images found in the JSON file")
+    else:
+        print(f"Successfully loaded {sum(1 for img, _, _ in images_data if img is not None)} images")
+        
+    return images_data
 
-def get_candidate_labels():
+def get_candidate_labels() -> List[str]:
     """Return the list of candidate X-ray pathology labels."""
+    # FIXME: TO CHANGE TARGET CLASSES, CHANGE THIS LIST
     candidate_labels = ["cardiomegaly", "atelectasis", "pneumonia", "effusion", "nodule", "mass", "no finding"]
     print(f"Using candidate labels: {', '.join(candidate_labels)}")
     return candidate_labels
@@ -90,9 +114,13 @@ def process_image(image, candidate_labels, processor, model, device):
     results = sorted(results, key=lambda x: x["probability"], reverse=True)
     return results
 
-def display_results(results):
-    """Display classification results in a formatted table."""
-    print("\nClassification Results:")
+def display_results(results: List[Dict], image_path: str = None) -> None:
+    """Display classification results in a formatted table for a single image."""
+    if image_path:
+        print(f"\nClassification Results for {os.path.basename(image_path)}:")
+    else:
+        print("\nClassification Results:")
+        
     print("-" * 45)
     print(f"{'Pathology':<20} {'Probability %':<15}")
     print("-" * 45)
@@ -100,4 +128,28 @@ def display_results(results):
     for res in results:
         print(f"{res['label']:<20} {res['probability']}%")
     
-    print("\nTop diagnosis:", results[0]['label'], f"({results[0]['probability']}% probability)") 
+    print("\nTop diagnosis:", results[0]['label'], f"({results[0]['probability']}% probability)")
+
+def display_summary(all_results: List[Dict[str, Any]], target_labels: List[str]) -> None:
+    """Display a summary of results for all processed images."""
+    print("\n" + "="*60)
+    print("SUMMARY OF RESULTS")
+    print("="*60)
+    
+    total = len(all_results)
+    correct = sum(1 for r in all_results if r['prediction'] in target_labels)
+    
+    print(f"Total images processed: {total}")
+    print(f"Images classified as {', '.join(target_labels)}: {correct} ({correct/total*100:.2f}%)")
+    
+    # Display distribution of top predictions
+    prediction_counts = {}
+    for r in all_results:
+        pred = r['prediction']
+        prediction_counts[pred] = prediction_counts.get(pred, 0) + 1
+    
+    print("\nPrediction distribution:")
+    for label, count in sorted(prediction_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {label:<20}: {count} ({count/total*100:.2f}%)")
+    
+    print("="*60)
