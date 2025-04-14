@@ -124,7 +124,7 @@ def process_image(image, candidate_labels, processor, model, device, prompt_temp
         texts = [label for label in candidate_labels]
     else:  # Default to "xray"
         texts = [f"This X-ray shows {label}." for label in candidate_labels] #
-    
+    # There is a {label}. 
     # Process all labels at once for efficiency
     inputs = processor(
         text=texts,
