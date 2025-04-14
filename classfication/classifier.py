@@ -10,6 +10,7 @@ from utils import (
     display_summary,
     extract_ground_truth_labels
 )
+from tqdm import tqdm
 
 def main():
     args = parse_args()
@@ -34,16 +35,15 @@ def main():
     
     # Process all images
     all_results = []
-    for i, (image, image_path, metadata) in enumerate(images_data):
+    # Using tqdm for progress visualization
+    for i, (image, image_path, metadata) in enumerate(tqdm(images_data, desc="Classifying", unit="image")):
         if image is None:
             if args.verbose:
-                print(f"Skipping image {i+1}/{len(images_data)}: Could not load")
+                print(f"\nSkipping image {i+1}/{len(images_data)}: Could not load")
             continue
         
         if args.verbose:
             print(f"\nProcessing image {i+1}/{len(images_data)}: {os.path.basename(image_path)}")
-        elif (i+1) % 10 == 0 or i+1 == len(images_data):
-            print(f"Progress: {i+1}/{len(images_data)} images processed", end="\r")
         
         # Process the image
         results = process_image(image, candidate_labels, processor, model, device)
@@ -76,8 +76,6 @@ def main():
             'metadata': metadata
         }
         all_results.append(result_entry)
-    
-    print("\n") # Clear progress line
     
     # Display summary of all results
     if all_results:
