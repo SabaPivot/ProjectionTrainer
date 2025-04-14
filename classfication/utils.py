@@ -12,6 +12,11 @@ def parse_args():
     parser.add_argument("--image_root", type=str, required=True, help="Root directory containing images")
     parser.add_argument("--json_file", type=str, required=True, help="JSON file containing image filenames")
     parser.add_argument("--verbose", action="store_true", help="Show detailed results for each image")
+    parser.add_argument("--candidate_labels", type=str, default="Atelectasis, No Finding", 
+                      help="Comma-separated list of candidate labels (e.g., 'Atelectasis, No Finding')")
+    parser.add_argument("--prompt_template", type=str, default="xray", 
+                      choices=["xray", "photo", "none"], 
+                      help="Prompt template to use (xray: 'This X-ray shows {label}.', photo: 'This is a photo of {label}.', none: just '{label}')")
     return parser.parse_args()
 
 def setup_device():
@@ -94,17 +99,31 @@ def extract_ground_truth_labels(normal_caption: str) -> List[str]:
     # Split by comma and strip whitespace
     return [label.strip() for label in normal_caption.split(", ")]
 
-def get_candidate_labels() -> List[str]:
-    """Return the list of candidate X-ray pathology labels."""
-    # FIXME: TO CHANGE TARGET CLASSES, CHANGE THIS LIST
-    candidate_labels = ["Atelectasis", "Effusion", "Cardiomegaly"]
+def get_candidate_labels(args) -> List[str]:
+    """
+    Return the list of candidate X-ray pathology labels.
+    
+    Args:
+        args: Command line arguments containing candidate_labels
+        
+    Returns:
+        List of candidate labels for classification
+    """
+    # Parse the comma-separated candidate labels from command line arguments
+    # Strip whitespace to handle both "Label1, Label2" and "Label1,Label2" formats
+    candidate_labels = [label.strip() for label in args.candidate_labels.split(",")]
     print(f"Using candidate labels: {', '.join(candidate_labels)}")
     return candidate_labels
 
-def process_image(image, candidate_labels, processor, model, device):
+def process_image(image, candidate_labels, processor, model, device, prompt_template="xray"):
     """Process image with SigLIP model and return classification results."""
-    # Create prompt templates for X-ray specific context
-    texts = [f"This X-ray shows {label}." for label in candidate_labels]
+    # Create prompt templates based on the specified template type
+    if prompt_template == "photo":
+        texts = [f"This is a photo of {label}." for label in candidate_labels] # Siglip default
+    elif prompt_template == "none":
+        texts = [label for label in candidate_labels]
+    else:  # Default to "xray"
+        texts = [f"This X-ray shows {label}." for label in candidate_labels] #
     
     # Process all labels at once for efficiency
     inputs = processor(
