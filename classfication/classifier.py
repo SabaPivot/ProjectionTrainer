@@ -25,7 +25,8 @@ def main():
         print("No images to process. Exiting.")
         return
     
-    candidate_labels = get_candidate_labels()
+    # Get candidate labels from command-line arguments
+    candidate_labels = get_candidate_labels(args)
     
     # Target labels for counting correct predictions
     target_labels = candidate_labels  # Using all candidate labels as targets
@@ -46,7 +47,7 @@ def main():
             print(f"\nProcessing image {i+1}/{len(images_data)}: {os.path.basename(image_path)}")
         
         # Process the image
-        results = process_image(image, candidate_labels, processor, model, device)
+        results = process_image(image, candidate_labels, processor, model, device, args.prompt_template)
         
         # Get normal_caption if available
         normal_caption = metadata.get('normal_caption', '')
