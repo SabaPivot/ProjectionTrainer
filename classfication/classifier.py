@@ -26,8 +26,8 @@ def main():
     candidate_labels = get_candidate_labels()
     
     # Target labels for counting correct predictions
-    target_labels = ["cardiomegaly", "atelectasis", "effusion"]
-    print(f"Counting matches for target labels: {', '.join(target_labels)}")
+    target_labels = candidate_labels  # Using all candidate labels as targets
+    print(f"Using labels for classification: {', '.join(target_labels)}")
     
     # Process all images
     all_results = []
@@ -41,8 +41,22 @@ def main():
         # Process the image
         results = process_image(image, candidate_labels, processor, model, device)
         
+        # Get normal_caption if available
+        normal_caption = metadata.get('normal_caption', '')
+        
         # Display individual results
-        display_results(results, image_path)
+        display_results(results, image_path, normal_caption)
+        
+        # Extract ground truth labels from normal_caption
+        ground_truth_labels = []
+        if normal_caption:
+            # Look for each target label in the normal_caption
+            for label in target_labels:
+                if label.lower() in normal_caption.lower():
+                    ground_truth_labels.append(label)
+            
+            if ground_truth_labels:
+                print(f"Found ground truth labels in caption: {', '.join(ground_truth_labels)}")
         
         # Store results for summary
         top_prediction = results[0]['label']
@@ -50,7 +64,9 @@ def main():
             'image_path': image_path,
             'prediction': top_prediction,
             'probability': results[0]['probability'],
-            'correct': top_prediction.lower() in target_labels,
+            'ground_truth': normal_caption if normal_caption else None,
+            'ground_truth_labels': ground_truth_labels,
+            'correct': top_prediction in ground_truth_labels if ground_truth_labels else top_prediction in target_labels,
             'metadata': metadata
         }
         all_results.append(result_entry)
@@ -61,7 +77,11 @@ def main():
         
         # Count correct predictions
         correct_count = sum(1 for r in all_results if r['correct'])
-        print(f"\nCount of correct predictions (matching {', '.join(target_labels)}): {correct_count}/{len(all_results)}")
+        total_count = len(all_results)
+        accuracy = (correct_count / total_count) * 100 if total_count > 0 else 0
+        
+        print(f"\nClassification Results:")
+        print(f"Correct predictions: {correct_count}/{total_count} ({accuracy:.2f}%)")
 
 if __name__ == "__main__":
     main()

@@ -32,6 +32,10 @@ def load_image_from_json(json_file: str, image_root: str) -> List[Tuple[Optional
     Returns:
         List of tuples, each containing (image object, image path, metadata dictionary)
         If an image can't be loaded, image will be None for that entry
+        
+    Note:
+        The metadata dictionary will contain all fields from the JSON entry,
+        including 'image' and 'normal_caption' if available.
     """
     print(f"Loading images from: {json_file}")
     images_data = []
@@ -42,7 +46,7 @@ def load_image_from_json(json_file: str, image_root: str) -> List[Tuple[Optional
             print("JSON file format not recognized. Expected a list of image entries.")
             return []
         
-        print(f"Found {len(data)} images in JSON file")
+        print(f"Found {len(data)} entries in JSON file")
         for i, item in enumerate(data):
             if 'image' not in item:
                 print(f"Skipping entry {i}: No 'image' field found")
@@ -50,6 +54,13 @@ def load_image_from_json(json_file: str, image_root: str) -> List[Tuple[Optional
                 
             image_filename = item['image']
             image_path = os.path.join(image_root, image_filename)
+            
+            # Extract normal_caption if available
+            normal_caption = item.get('normal_caption', '')
+            if normal_caption:
+                print(f"Entry {i} has normal_caption: {normal_caption[:50]}..." if len(normal_caption) > 50 else normal_caption)
+            else:
+                print(f"Entry {i} has no normal_caption")
             
             # Check if image exists
             if not os.path.exists(image_path):
@@ -66,16 +77,17 @@ def load_image_from_json(json_file: str, image_root: str) -> List[Tuple[Optional
                 images_data.append((None, image_path, item))
     
     if not images_data:
-        print("No valid images found in the JSON file")
+        print("No valid entries found in the JSON file")
     else:
         print(f"Successfully loaded {sum(1 for img, _, _ in images_data if img is not None)} images")
+        print(f"With normal_caption: {sum(1 for _, _, meta in images_data if 'normal_caption' in meta)}")
         
     return images_data
 
 def get_candidate_labels() -> List[str]:
     """Return the list of candidate X-ray pathology labels."""
     # FIXME: TO CHANGE TARGET CLASSES, CHANGE THIS LIST
-    candidate_labels = ["cardiomegaly", "atelectasis", "pneumonia", "effusion", "nodule", "mass", "no finding"]
+    candidate_labels = ["Atelectasis", "Effusion", "Cardiomegaly"]
     print(f"Using candidate labels: {', '.join(candidate_labels)}")
     return candidate_labels
 
@@ -114,12 +126,15 @@ def process_image(image, candidate_labels, processor, model, device):
     results = sorted(results, key=lambda x: x["probability"], reverse=True)
     return results
 
-def display_results(results: List[Dict], image_path: str = None) -> None:
+def display_results(results: List[Dict], image_path: str = None, normal_caption: str = None) -> None:
     """Display classification results in a formatted table for a single image."""
     if image_path:
         print(f"\nClassification Results for {os.path.basename(image_path)}:")
     else:
         print("\nClassification Results:")
+    
+    if normal_caption:
+        print(f"Ground truth: {normal_caption[:100]}..." if len(normal_caption) > 100 else normal_caption)
         
     print("-" * 45)
     print(f"{'Pathology':<20} {'Probability %':<15}")
@@ -141,6 +156,13 @@ def display_summary(all_results: List[Dict[str, Any]], target_labels: List[str])
     
     print(f"Total images processed: {total}")
     print(f"Images classified as {', '.join(target_labels)}: {correct} ({correct/total*100:.2f}%)")
+    
+    # Analyze accuracy using normal_caption if available
+    has_ground_truth = sum(1 for r in all_results if r.get('ground_truth'))
+    if has_ground_truth:
+        print(f"\nImages with ground truth labels: {has_ground_truth}")
+        matches = sum(1 for r in all_results if r.get('ground_truth') and r['prediction'] in r.get('ground_truth_labels', []))
+        print(f"Predictions matching ground truth: {matches} ({matches/has_ground_truth*100:.2f}%)")
     
     # Display distribution of top predictions
     prediction_counts = {}
