@@ -230,6 +230,19 @@ def display_summary(all_results: List[Dict[str, Any]], target_labels: List[str])
                 print(f"  {label:<20}: {stats['correct']}/{stats['total']} ({accuracy:.2f}%)")
             else:
                 print(f"  {label:<20}: 0/0 (0.00%)")
+        
+        # Count and display distribution of normal_caption values
+        print("\nGround Truth Distribution:")
+        normal_caption_counts = {}
+        for result in all_results:
+            caption = result.get('ground_truth')
+            if caption:
+                normal_caption_counts[caption] = normal_caption_counts.get(caption, 0) + 1
+        
+        # Sort by frequency (highest first)
+        for caption, count in sorted(normal_caption_counts.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / has_ground_truth) * 100
+            print(f"  {caption:<40}: {count} ({percentage:.2f}%)")
     
     # Display distribution of top predictions
     prediction_counts = {}
