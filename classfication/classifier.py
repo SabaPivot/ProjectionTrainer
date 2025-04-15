@@ -1,97 +1,93 @@
-import torch
-from PIL import Image
-from transformers import SiglipProcessor, SiglipModel
 import os
-import json
-import argparse
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Classify X-ray images with SigLIP")
-    parser.add_argument("--image_root", type=str, required=True, help="Root directory containing images")
-    parser.add_argument("--json_file", type=str, required=True, help="JSON file containing image filenames")
-    return parser.parse_args()
+from utils import (
+    parse_args,
+    setup_device,
+    load_model,
+    load_image_from_json,
+    get_candidate_labels,
+    process_image,
+    display_results,
+    display_summary,
+    extract_ground_truth_labels
+)
+from tqdm import tqdm
 
 def main():
     args = parse_args()
+    device = setup_device()
     
-    # Device setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device set to use {device}")
-    
-    # Load model and processor
     model_name = "StanfordAIMI/XraySigLIP__vit-l-16-siglip-384__webli"
-    processor = SiglipProcessor.from_pretrained(model_name)
-    model = SiglipModel.from_pretrained(model_name).to(device)
+    processor, model = load_model(model_name, device)
     
-    # Load image filename from JSON
-    print(f"Loading image filenames from: {args.json_file}")
-    with open(args.json_file, 'r') as f:
-        data = json.load(f)
-        # Assuming JSON file has at least one entry with an 'image' key
-        if isinstance(data, list) and len(data) > 0 and 'image' in data[0]:
-            image_filename = data[0]['image']
-        else:
-            print("JSON file format not recognized. Please provide a valid file.")
-            return
-    
-    # Create image path
-    image_path = os.path.join(args.image_root, image_filename)
-    
-    # Check if image exists
-    if not os.path.exists(image_path):
-        print(f"Error: Image not found at {image_path}")
+    # Load all images from JSON file
+    images_data = load_image_from_json(args.json_file, args.image_root)
+    if not images_data:
+        print("No images to process. Exiting.")
         return
     
-    # Load image from local path
-    print(f"Analyzing X-ray image: {image_path}")
-    image = Image.open(image_path).convert("RGB")
+    # Get candidate labels from command-line arguments
+    candidate_labels = get_candidate_labels(args)
     
-    # Define candidate labels for chest X-ray pathologies
-    candidate_labels = ["cardiomegaly", "atelectasis", "pneumonia", "effusion", "nodule", "mass", "no finding"]
-    print(f"Using candidate labels: {', '.join(candidate_labels)}")
+    # Target labels for counting correct predictions
+    target_labels = candidate_labels  # Using all candidate labels as targets
+    print(f"Using labels for classification: {', '.join(target_labels)}")
     
-    # Create prompt templates for X-ray specific context
-    texts = [f"This X-ray shows {label}." for label in candidate_labels]
+    print(f"Processing {len(images_data)} images...")
     
-    # Process all labels at once for efficiency
-    # Note: Using padding="max_length" as recommended in SigLIP documentation
-    inputs = processor(
-        text=texts,
-        images=image, 
-        return_tensors="pt", 
-        padding="max_length"
-    ).to(device)
+    # Process all images
+    all_results = []
+    # Using tqdm for progress visualization
+    for i, (image, image_path, metadata) in enumerate(tqdm(images_data, desc="Classifying", unit="image")):
+        if image is None:
+            if args.verbose:
+                print(f"\nSkipping image {i+1}/{len(images_data)}: Could not load")
+            continue
+        
+        if args.verbose:
+            print(f"\nProcessing image {i+1}/{len(images_data)}: {os.path.basename(image_path)}")
+        
+        # Process the image
+        results = process_image(image, candidate_labels, processor, model, device, args.prompt_template)
+        
+        # Get normal_caption if available
+        normal_caption = metadata.get('normal_caption', '')
+        
+        # Display individual results (if verbose)
+        display_results(results, image_path, normal_caption, args.verbose)
+        
+        # Extract ground truth labels from normal_caption using comma separation
+        ground_truth_labels = extract_ground_truth_labels(normal_caption)
+        
+        if args.verbose and ground_truth_labels:
+            print(f"Ground truth labels from caption: {', '.join(ground_truth_labels)}")
+        
+        # Store results for summary
+        top_prediction = results[0]['label']
+        
+        # Check if prediction is correct (appears in comma-separated normal_caption)
+        is_correct = top_prediction in ground_truth_labels if ground_truth_labels else False
+        
+        result_entry = {
+            'image_path': image_path,
+            'prediction': top_prediction,
+            'probability': results[0]['probability'],
+            'ground_truth': normal_caption if normal_caption else None,
+            'ground_truth_labels': ground_truth_labels,
+            'correct': is_correct,
+            'metadata': metadata
+        }
+        all_results.append(result_entry)
     
-    # Forward pass
-    with torch.no_grad():
-        outputs = model(**inputs)
-    
-    # Get logits_per_image (Comparing each label to one image)
-    logits_per_image = outputs.logits_per_image[0]  # Shape: (num_labels,)
-    
-    probs = torch.nn.functional.softmax(logits_per_image, dim=0)
-    
-    # Create results
-    results = []
-    for i, label in enumerate(candidate_labels):
-        results.append({
-            "probability": round(probs[i].item() * 100, 2),
-            "label": label
-        })
-    
-    # Sort by probability (highest first)
-    results = sorted(results, key=lambda x: x["probability"], reverse=True)
-    
-    # Display results
-    print("\nClassification Results:")
-    print("-" * 45)
-    print(f"{'Pathology':<20} {'Probability %':<15}")
-    print("-" * 45)
-    
-    for res in results:
-        print(f"{res['label']:<20} {res['probability']}%")
-    
-    print("\nTop diagnosis:", results[0]['label'], f"({results[0]['probability']}% probability)")
+    # Display summary of all results
+    if all_results:
+        display_summary(all_results, target_labels)
+        
+        # Count correct predictions
+        correct_count = sum(1 for r in all_results if r['correct'])
+        total_count = len(all_results)
+        accuracy = (correct_count / total_count) * 100 if total_count > 0 else 0
+        
+        print(f"\nFINAL CLASSIFICATION ACCURACY: {correct_count}/{total_count} ({accuracy:.2f}%)")
 
 if __name__ == "__main__":
     main()
