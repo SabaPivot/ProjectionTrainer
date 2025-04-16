@@ -107,6 +107,7 @@ def main():
     parser.add_argument("--disable_wandb", action='store_true', help="Disable Weights & Biases logging")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="Number of steps to accumulate gradients over.")
     parser.add_argument("--img_size", type=int, default=384, help="Image size")
+    parser.add_argument("--save_every_n_epochs", type=int, default=2, help="Save projector checkpoint every N epochs. Set to 0 to disable epoch checkpoints (only save at end).") # Added
 
     args = parser.parse_args()
 
@@ -132,11 +133,19 @@ def main():
 
     # --- Load Language Model (Frozen) ---
     llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
-    llm_model = Gemma3ForCausalLM.from_pretrained(
-        args.llm_name,
-        torch_dtype=model_dtype,
-        low_cpu_mem_usage=True
-    )
+    if "gemma" in args.llm_name:
+        llm_model = Gemma3ForCausalLM.from_pretrained(
+            args.llm_name,
+            torch_dtype=model_dtype,
+            low_cpu_mem_usage=True
+        )
+    else:
+        llm_model = AutoModelForCausalLM.from_pretrained(
+            args.llm_name,
+            torch_dtype=model_dtype,
+            low_cpu_mem_usage=True
+        )
+
     # Enable gradient checkpointing to save memory on the frozen LLM
     llm_model.gradient_checkpointing_enable()
     logger.info(f"Loaded language model: {args.llm_name} and enabled gradient checkpointing.")
@@ -158,6 +167,13 @@ def main():
     # --- Use the imported MLPProjector ---
     projection = MLPProjector(vision_dim=vision_dim, llm_dim=llm_dim)
     logger.info(f"Initialized Projector ({type(projection).__name__}) with vision_dim={vision_dim}, llm_dim={llm_dim}. Output tokens = input patch tokens.")
+    
+    # --- Add Debug Log --- #
+    # Assuming default expansion_factor=10 from MLPProjector definition
+    expansion_factor = 10 # TODO: Hardcoded based on MLPProjector default, consider making dynamic if default changes
+    intermediate_dim = vision_dim * expansion_factor
+    logger.info(f"Projector Dimensions for LLM '{args.llm_name}': Vision({vision_dim}) -> Expanded({intermediate_dim}) -> LLM({llm_dim})")
+    # ---------------------
 
 
     # --- Create Dataset ---
@@ -194,7 +210,8 @@ def main():
         num_epochs=args.num_epochs,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         warmup_ratio=args.warmup_ratio,
-        wandb_project=args.wandb_project
+        wandb_project=args.wandb_project,
+        save_every_n_epochs=args.save_every_n_epochs
     )
 
     # --- WandB Watch ---

@@ -9,6 +9,7 @@ import math
 from transformers import get_cosine_schedule_with_warmup
 import json
 from PIL import Image # Added for validation image loading
+import time
 
 # Setup logger for this module
 logger = logging.getLogger(__name__)
@@ -30,7 +31,8 @@ class ProjectionTrainerStage1:
         num_epochs=10,
         gradient_accumulation_steps=1,
         warmup_ratio=0.0,
-        wandb_project="xray_projection_training"
+        wandb_project="xray_projection_training",
+        save_every_n_epochs=0 # Added: Default 0 means only save at end
     ):
         self.accelerator = accelerator
         self.vision_encoder = vision_encoder
@@ -43,6 +45,7 @@ class ProjectionTrainerStage1:
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.wandb_project = wandb_project
+        self.save_every_n_epochs = save_every_n_epochs # Store the value
 
         if self.accelerator.is_main_process:
             os.makedirs(output_dir, exist_ok=True)
@@ -248,14 +251,18 @@ class ProjectionTrainerStage1:
             num_optimizer_steps_per_epoch = math.ceil(len(self.train_loader) / self.accelerator.gradient_accumulation_steps)
             avg_epoch_train_loss = epoch_train_loss / num_optimizer_steps_per_epoch
 
+            # --- Epoch Logging ---
             if self.accelerator.is_main_process:
-                logger.info(f"Epoch {epoch+1}/{self.num_epochs} - Avg Train Loss: {avg_epoch_train_loss:.4f}")
                 epoch_log_dict = {
-                     "train/epoch_loss": avg_epoch_train_loss,
-                     "epoch": epoch + 1
-                 }
-                # Log epoch loss at the correct global step
-                self.accelerator.log(epoch_log_dict, step=global_step)
+                    "train/epoch_loss": avg_epoch_train_loss,
+                    "epoch": epoch + 1
+                }
+                self.accelerator.log(epoch_log_dict, step=global_step) # Log against final step of epoch
+                logger.info(f"Epoch {epoch+1}/{self.num_epochs} completed. Avg Train Loss: {avg_epoch_train_loss:.4f}")
+
+                # --- Periodic Saving --- # Added
+                if self.save_every_n_epochs > 0 and (epoch + 1) % self.save_every_n_epochs == 0:
+                    self.save_projection(epoch=epoch+1)
 
             # --- Validation Step (on main process only) ---
             if self.accelerator.is_main_process:
@@ -265,7 +272,7 @@ class ProjectionTrainerStage1:
                 # Vision encoder should already be in eval mode
 
                 val_image_path = "/home/compu/samuel/Siglip/images/001.png"
-                max_new_tokens_val = 512 # Limit generated tokens for validation output
+                max_new_tokens_val = 128 # Limit generated tokens for validation output
 
                 try:
                     with torch.no_grad():
@@ -342,79 +349,76 @@ class ProjectionTrainerStage1:
                     # Ensure model is back in training mode
                     self.projection_layer.train()
 
-            # --- Regular Checkpointing --- 
-            # Note: No longer saving based on best val loss
-            if (epoch + 1) % 5 == 0 or epoch == self.num_epochs - 1:
-                    if self.accelerator.is_main_process:
-                        save_path = os.path.join(self.output_dir, f"checkpoint-epoch{epoch+1}")
-                        self.save_projection(save_path)
+        # --- End of Training --- # (Save final model)
+        logger.info("Stage 1 Training finished.")
+        self.save_projection(epoch=self.num_epochs) # Save final projector
+        logger.info(f"Final trained projector saved to {self.output_dir}")
 
-        # --- Final Save ---
+    def save_projection(self, epoch=None):
+        """Save the trained projection layer state dictionary."""
+        # Simplified save approach that avoids wait_for_everyone() and long timeouts
+        
+        # Only the main process saves the model
         if self.accelerator.is_main_process:
-            final_save_path = os.path.join(self.output_dir, "final_model")
-            self.save_projection(final_save_path)
-            logger.info("Final Stage 1 projector model saved.")
-
-        logger.info(f"Process {self.accelerator.process_index}: Stage 1 training complete!")
-
-        return self.projection_layer
-
-    def save_projection(self, path):
-        """Save the trained projection layer state_dict and config (main process only)"""
-        if not self.accelerator.is_main_process:
-            return
-
-        os.makedirs(path, exist_ok=True)
-        unwrapped_model = self.accelerator.unwrap_model(self.projection_layer)
-
-        # Save only the projection model weights using accelerator.save_model
-        self.accelerator.save_model(unwrapped_model, path) # Preferred method
-        logger.info(f"Projection model saved using accelerator.save_model to {path}")
-
-        # --- Manual Config Saving (Robustness) ---
-        # NOTE: Assumes PooledPatchVisualProjection has 'projection' and 'num_tokens' attributes
-        # If your projector is different (e.g., a simple nn.Linear), adjust accordingly.
-        # If it's a 2-layer MLP as in CheXagent, you need to define how to get dimensions.
-        try:
-             # --- Updated logic for nn.Sequential MLP ---
-            # Check if unwrapped_model is MLPProjector and has 'model' attribute which is Sequential
-            if hasattr(unwrapped_model, 'model') and isinstance(unwrapped_model.model, nn.Sequential):
-                seq_model = unwrapped_model.model
-                if len(seq_model) > 0 and isinstance(seq_model[0], nn.Linear):
-                     # Get input dim from first linear layer
-                    vision_dim = seq_model[0].in_features
-                    # Get output dim from last linear layer (could be index 0 or 2 depending on structure)
-                    # Find the last Linear layer in the sequence
-                    last_linear_layer = None
-                    for layer in reversed(seq_model):
-                        if isinstance(layer, nn.Linear):
-                            last_linear_layer = layer
-                            break
-                    if last_linear_layer:
-                        llm_dim = last_linear_layer.out_features
-                        logger.info(f"Determined MLP dims: vision_dim={vision_dim}, llm_dim={llm_dim}")
-                    else:
-                         logger.warning(f"Could not find last Linear layer in unwrapped_model.model. Using fallbacks.")
-                         vision_dim, llm_dim = 0, 0 # Fallback
-                else:
-                     logger.warning(f"Unwrapped model's '.model' attribute is not a Sequential or doesn't start with Linear. Using fallbacks.")
-                     vision_dim, llm_dim = 0, 0 # Fallback
-            else: # Fallback if structure is unexpected (e.g., not our MLPProjector)
-                logger.warning(f"Could not reliably determine projector dimensions from unwrapped model structure type: {type(unwrapped_model)}. Using fallbacks.")
-                # Attempt to get from config if available, otherwise use 0
-                vision_dim = getattr(unwrapped_model.config, 'vision_dim', 0) if hasattr(unwrapped_model, 'config') else 0
-                llm_dim = getattr(unwrapped_model.config, 'llm_dim', 0) if hasattr(unwrapped_model, 'config') else 0
-
-        except Exception as e:
-            logger.error(f"Could not retrieve dimensions from unwrapped projection_layer: {e}", exc_info=True)
-            vision_dim, llm_dim = 0, 0 # Set defaults on error
-
-        # Config no longer includes num_tokens for MLP projector
-        config = { "vision_dim": vision_dim, "llm_dim": llm_dim }
-        config_save_path = os.path.join(path, "projector_config.json")
-        try:
-            with open(config_save_path, 'w') as f:
-                json.dump(config, f, indent=4)
-            logger.info(f"Manual projector config saved to {config_save_path}")
-        except Exception as e:
-            logger.error(f"Failed to save manual projector config: {e}") 
+            # Allow a short pause (1-2 seconds) for other processes to sync up naturally
+            # This avoids immediate saving while other processes might still be finishing tasks
+            time.sleep(2)
+            
+            # Unwrap the model to get the raw nn.Module for saving
+            unwrapped_projection_layer = self.accelerator.unwrap_model(self.projection_layer)
+            
+            # Determine filename
+            if epoch is not None:
+                save_filename = f"projector_epoch_{epoch}.bin"
+            else:
+                save_filename = "projector_final.bin"
+                
+            save_path = os.path.join(self.output_dir, save_filename)
+            
+            # Save the state dict
+            try:
+                torch.save(unwrapped_projection_layer.state_dict(), save_path)
+                logger.info(f"Projection layer state dict saved to {save_path}")
+                
+                # --- Manual Config Saving (Robustness) ---
+                try:
+                    # --- Updated logic for nn.Sequential MLP ---
+                    if hasattr(unwrapped_projection_layer, 'model') and isinstance(unwrapped_projection_layer.model, nn.Sequential):
+                        seq_model = unwrapped_projection_layer.model
+                        if len(seq_model) > 0 and isinstance(seq_model[0], nn.Linear):
+                            # Get input dim from first linear layer
+                            vision_dim = seq_model[0].in_features
+                            # Get output dim from last linear layer
+                            last_linear_layer = None
+                            for layer in reversed(seq_model):
+                                if isinstance(layer, nn.Linear):
+                                    last_linear_layer = layer
+                                    break
+                            if last_linear_layer:
+                                llm_dim = last_linear_layer.out_features
+                                logger.info(f"Determined MLP dims: vision_dim={vision_dim}, llm_dim={llm_dim}")
+                            else:
+                                logger.warning(f"Could not find last Linear layer in unwrapped_model.model. Using fallbacks.")
+                                vision_dim, llm_dim = 0, 0 # Fallback
+                        else:
+                            logger.warning(f"Unwrapped model's '.model' attribute is not a Sequential or doesn't start with Linear. Using fallbacks.")
+                            vision_dim, llm_dim = 0, 0 # Fallback
+                    else: # Fallback if structure is unexpected
+                        logger.warning(f"Could not reliably determine projector dimensions from unwrapped model structure type: {type(unwrapped_projection_layer)}. Using fallbacks.")
+                        # Attempt to get from config if available, otherwise use 0
+                        vision_dim = getattr(unwrapped_projection_layer.config, 'vision_dim', 0) if hasattr(unwrapped_projection_layer, 'config') else 0
+                        llm_dim = getattr(unwrapped_projection_layer.config, 'llm_dim', 0) if hasattr(unwrapped_projection_layer, 'config') else 0
+                
+                    # Config no longer includes num_tokens for MLP projector
+                    config = { "vision_dim": vision_dim, "llm_dim": llm_dim }
+                    # Save config to the output directory, not inside the checkpoint file path
+                    config_save_path = os.path.join(self.output_dir, "projector_config.json")
+                    with open(config_save_path, 'w') as f:
+                        json.dump(config, f, indent=4)
+                    logger.info(f"Manual projector config saved to {config_save_path}")
+                
+                except Exception as e:
+                    logger.error(f"Error saving config: {e}", exc_info=True)
+            
+            except Exception as e:
+                logger.error(f"Error saving model: {e}", exc_info=True) 
