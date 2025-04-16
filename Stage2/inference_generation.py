@@ -56,7 +56,7 @@ def process_sample(sample, image_root, processor, vision_encoder, projection_lay
             projected_embeds = projection_layer(patch_embeddings)
             
             # 3. Create prompt for generation
-            prompt = "Describe what you see in this chest X-ray image."
+            prompt = "Identify the diseases in this chest X-ray image. Provide your answer in a single word or phrase."
             
             # Tokenize prompt
             prompt_tokens = llm_tokenizer(

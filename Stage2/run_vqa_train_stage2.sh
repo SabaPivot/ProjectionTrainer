@@ -3,13 +3,13 @@
 export CUDA_VISIBLE_DEVICES=1,2,3 # Adjust GPU IDs as needed
 
 # --- Configuration --- #
-RUN_NAME="all_merged_dataset" # Choose a descriptive name for your run
-STAGE1_RUN_NAME="VD_Class_20_lr5e-5_gemma3_vit-l-384" # Name of the Stage 1 run directory
+RUN_NAME="VD_Class_20_lr5e-5_gemma3_vit-l-384-QA_BALANCED" # Choose a descriptive name for your run
+STAGE1_RUN_NAME="VD_Class_20_lr5e-5_gemma3_vit-l-384-QA_BALANCED" # Name of the Stage 1 run directory
 
 # --- Paths --- #
 # Adjust these paths according to your setup
-TRAIN_JSON="/mnt/WHY/VLM/Deepseek/VLM-R1/QA_DATASET/Train/All/merged_dataset.json" #"/mnt/WHY/VLM/Deepseek/VLM-R1/QA_DATASET/Train/Only_VD/All/merged_dataset.json"
-VAL_JSON="/mnt/samuel/Siglip/ProjectionTrainer/VDvalidation_with_Atelectasis.json" # Path to your VQA JSON data
+TRAIN_JSON="/mnt/WHY/VLM/Deepseek/VLM-R1/QA_DATASET/Train/Atelectasis+Cardiomegaly+Effusion/QA_Balancing/transformed_train.json" #"/mnt/WHY/VLM/Deepseek/VLM-R1/QA_DATASET/Train/Only_VD/All/merged_dataset.json"
+VAL_JSON="/mnt/WHY/VLM/Deepseek/VLM-R1/QA_DATASET/Train/Atelectasis+Cardiomegaly+Effusion/QA_Balancing/transformed_val.json" # Path to your VQA JSON data
 IMAGE_ROOT="/mnt/data/CXR/NIH Chest X-rays_jpg" # Path to your images
 STAGE1_PROJECTOR_PATH="/mnt/samuel/Siglip/ProjectionTrainer/0411Stage1/0411" # Path to the saved Stage 1 projector
 OUTPUT_DIR="./trained_vqa_stage2/${RUN_NAME}" # Output directory for this Stage 2 run
@@ -22,7 +22,7 @@ LLM_MODEL="google/gemma-3-1b-it"
 # Adjust these based on your GPU memory and dataset size
 BATCH_SIZE=1
 NUM_EPOCHS=10
-LEARNING_RATE=5e-6
+LEARNING_RATE=1e-5
 GRAD_ACCUM_STEPS=8    
 WARMUP_RATIO=0.05
 WEIGHT_DECAY=0.01
