@@ -11,6 +11,7 @@ STAGE1_RUN_NAME="VD_Class_20_lr5e-5_gemma3_vit-l-384-QA_BALANCED" # Name of the 
 TRAIN_JSON="/mnt/WHY/VLM/Deepseek/VLM-R1/QA_DATASET/Train/Atelectasis+Cardiomegaly+Effusion/QA_Balancing/transformed_train.json" #"/mnt/WHY/VLM/Deepseek/VLM-R1/QA_DATASET/Train/Only_VD/All/merged_dataset.json"
 VAL_JSON="/mnt/WHY/VLM/Deepseek/VLM-R1/QA_DATASET/Train/Atelectasis+Cardiomegaly+Effusion/QA_Balancing/transformed_val.json" # Path to your VQA JSON data
 IMAGE_ROOT="/mnt/data/CXR/NIH Chest X-rays_jpg" # Path to your images
+IMAGE_ROOT_2="/path/to/your/secondary/image/directory"  # Update this with your secondary image root path
 STAGE1_PROJECTOR_PATH="/mnt/samuel/Siglip/ProjectionTrainer/0411Stage1/0411" # Path to the saved Stage 1 projector
 OUTPUT_DIR="./trained_vqa_stage2/${RUN_NAME}" # Output directory for this Stage 2 run
 
@@ -51,6 +52,7 @@ accelerate launch --mixed_precision bf16 train_vqa_stage2.py \
     --train_json "$TRAIN_JSON" \
     --val_json "$VAL_JSON" \
     --image_root "$IMAGE_ROOT" \
+    --image_root_2 "$IMAGE_ROOT_2" \
     --vision_model_name "$VISION_MODEL" \
     --llm_name "$LLM_MODEL" \
     --stage1_projector_path "$STAGE1_PROJECTOR_PATH" \

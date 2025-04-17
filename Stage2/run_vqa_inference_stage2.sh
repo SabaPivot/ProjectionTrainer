@@ -5,12 +5,14 @@ LLM_DIR="/mnt/samuel/Siglip/ProjectionTrainer/Stage2/trained_vqa_stage2/VD_Class
 PROJECTOR_DIR="/mnt/samuel/Siglip/ProjectionTrainer/Stage2/trained_vqa_stage2/VD_Class_20_lr2e-5_gemma3_vit-l-384-DR-with disease classes-epoch4/final_model/projection_layer"
 INPUT_JSON="/mnt/samuel/Siglip/ProjectionTrainer/VDvalidation_with_Atelectasis.json"
 IMAGE_ROOT="/mnt/data/CXR/NIH Chest X-rays_jpg" # Base directory for images
+IMAGE_ROOT_2="/path/to/your/secondary/image/directory" # Base directory for secondary image format
 
 python inference_vqa_stage2.py \
     --llm_path "${LLM_DIR}" \
     --projector_path "${PROJECTOR_DIR}" \
     --input_json "${INPUT_JSON}" \
     --image_root "${IMAGE_ROOT}" \
+    --image_root_2 "${IMAGE_ROOT_2}" \
     --max_new_tokens 1024 \
     --temperature 0.3 \
     --top_p 0.9 \

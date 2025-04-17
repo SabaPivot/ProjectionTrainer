@@ -9,18 +9,20 @@ logger = logging.getLogger(__name__)
 
 class XrayVQADataset(Dataset):
     """Dataset for X-ray images, questions, and their corresponding answers from JSON"""
-    def __init__(self, image_root, json_file, processor, tokenizer, img_size, max_q_len=128, max_a_len=512):
+    def __init__(self, image_root, json_file, processor, tokenizer, img_size, max_q_len=128, max_a_len=512, image_root_2=None):
         """
         Args:
-            image_root (str): Path to the directory containing images.
+            image_root (str): Path to the primary directory containing images.
             json_file (str): Path to the JSON file containing the data triplets.
             processor: Vision processor for images.
             tokenizer: Language model tokenizer.
             img_size (int): Target size to resize images to (e.g., 384).
             max_q_len (int): Maximum token length for the question ('problem').
             max_a_len (int): Maximum token length for the answer ('normal_caption').
+            image_root_2 (str, optional): Path to the secondary directory containing images with different path format.
         """
         self.image_root = image_root
+        self.image_root_2 = image_root_2
         self.img_size = img_size
         self.processor = processor
         self.tokenizer = tokenizer
@@ -64,7 +66,15 @@ class XrayVQADataset(Dataset):
                 logger.warning(f"Sample {idx} is missing required fields (image, problem, or normal_caption). Skipping.")
                 return self.__getitem__((idx + 1) % len(self)) # Recursively get next valid item
 
-            image_path = os.path.join(self.image_root, image_filename)
+            # Determine which image root to use based on the image path format
+            if image_filename.startswith("p") and "/" in image_filename and self.image_root_2:
+                # Second format: "p10012261/s50349409"
+                image_path = os.path.join(self.image_root_2, image_filename)
+                logger.debug(f"Using secondary image root for path: {image_path}")
+            else:
+                # Original format: "images_002/images/00001836_057.jpg"
+                image_path = os.path.join(self.image_root, image_filename)
+                logger.debug(f"Using primary image root for path: {image_path}")
 
             # --- Image Processing ---
             image = Image.open(image_path).convert('RGB')
