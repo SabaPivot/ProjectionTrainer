@@ -76,6 +76,7 @@ def main():
 
     # --- Data Arguments ---
     parser.add_argument("--image_root", type=str, required=True, help="Root directory with training images")
+    parser.add_argument("--image_root_2", type=str, default=None, help="Secondary root directory for images with a different path format (e.g., 'p10012261/s50349409')")
     parser.add_argument("--train_json", type=str, required=True, help="JSON file with training image-question-answer triplets")
     parser.add_argument("--val_json", type=str, required=True, help="JSON file with validation image-question-answer triplets")
     parser.add_argument("--img_size", type=int, default=384, help="Image size")
@@ -181,6 +182,7 @@ def main():
             img_size=args.img_size,
             max_q_len=args.max_q_len,
             max_a_len=args.max_a_len,
+            image_root_2=args.image_root_2,
         )
         logger.info(f"Loaded Train dataset with {len(train_dataset)} samples.")
         val_dataset = XrayVQADataset(
@@ -191,6 +193,7 @@ def main():
             img_size=args.img_size,
             max_q_len=args.max_q_len,
             max_a_len=args.max_a_len,
+            image_root_2=args.image_root_2,
         )
         logger.info(f"Loaded Validation dataset with {len(val_dataset)} samples.")
     except Exception as e:
