@@ -17,3 +17,9 @@ CheXagent.py
 images/
 
 Stage2/trained_vqa_stage2/
+
+*.txt
+
+*.json
+
+*.csv
