@@ -187,7 +187,7 @@ class VisionEncoderTrainerStage0:
         freeze_logit_scale=True,  # Freeze logit_scale by default
         wandb_project="vision_encoder_contrastive_finetuning", # Updated project name
         save_every_n_epochs=1,
-        logging_steps=100 # Add logging_steps parameter
+        logging_steps=100
     ):
         self.accelerator = accelerator
         self.processor = processor
@@ -466,18 +466,18 @@ class VisionEncoderTrainerStage0:
         logger.info(f"Final fine-tuned vision encoder saved to {self.output_dir}")
 
     def save_model(self, epoch=None):
-        """Save the fine-tuned vision encoder model state."""
-        # Ensure model saving happens only on the main process
+        """Save the model and optionally trigger visualization."""
         if self.accelerator.is_main_process:
             save_dir_name = f"epoch_{epoch}" if epoch is not None else "final_model"
             full_save_dir = os.path.join(self.output_dir, save_dir_name)
             os.makedirs(full_save_dir, exist_ok=True)
 
-            # Unwrap the main model to access sub-components
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
-
-            # --- Save the Full Model using save_pretrained --- 
+            logger.info(f"Starting save for {save_dir_name}...")
             try:
+                # Unwrap the main model to access sub-components
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                
+                # --- Save the Full Model using save_pretrained --- 
                 logger.info(f"Saving full model to {full_save_dir}")
                 unwrapped_model.save_pretrained(full_save_dir)
                 logger.info(f"Full model saved successfully.")
@@ -492,32 +492,6 @@ class VisionEncoderTrainerStage0:
 
             except Exception as e:
                  logger.error(f"Error saving full model/processor/tokenizer to {full_save_dir}: {e}", exc_info=True)
-
-            # --- (Optional) Keep code for saving only vision encoder if needed --- 
-            # # Save only the vision_encoder part
-            # if hasattr(unwrapped_model, 'vision_model'):
-            #     vision_encoder_save_path = os.path.join(full_save_dir, "vision_encoder.bin") # Or .safetensors
-            #     try:
-            #         # Save state dict directly
-            #         torch.save(unwrapped_model.vision_model.state_dict(), vision_encoder_save_path)
-            #         logger.info(f"Vision encoder state_dict saved to {vision_encoder_save_path}")
-                    
-            #         # Save processor alongside the vision encoder weights
-            #         if hasattr(self, 'processor') and self.processor:
-            #              self.processor.save_pretrained(full_save_dir)
-            #              logger.info(f"Processor config saved to {full_save_dir}")
-            #         # Save tokenizer if it's different or needs specific config
-            #         if hasattr(self, 'tokenizer') and self.tokenizer:
-            #              self.tokenizer.save_pretrained(full_save_dir)
-            #              logger.info(f"Tokenizer config saved to {full_save_dir}")
-
-            #     except Exception as e:
-            #          logger.error(f"Error saving vision encoder state/processor/tokenizer to {full_save_dir}: {e}", exc_info=True)
-            # else:
-            #     logger.error("Could not find 'vision_model' attribute in unwrapped model. Cannot save vision encoder separately.")
-
-        # Remove wait_for_everyone() here, let accelerate handle synchronization implicitly
-        # self.accelerator.wait_for_everyone()
 
 # --- Argument Parser ---
 def parse_args():
@@ -559,7 +533,6 @@ def parse_args():
     parser.add_argument("--mixed_precision", type=str, default="no", help="Mixed precision type ('no', 'fp16', 'bf16')")
     # Add disable_wandb argument needed by setup script
     parser.add_argument("--disable_wandb", action='store_true', help="Disable WandB logging.")
-
 
     return parser.parse_args()
 
@@ -638,7 +611,7 @@ def main():
             freeze_logit_scale=args.freeze_logit_scale,
             wandb_project=args.wandb_project,
             save_every_n_epochs=args.save_every_n_epochs,
-            logging_steps=args.logging_steps # Pass logging_steps
+            logging_steps=args.logging_steps # Removed args passing
         )
     except Exception as e:
         logger.error(f"Failed to initialize trainer: {e}", exc_info=True)
