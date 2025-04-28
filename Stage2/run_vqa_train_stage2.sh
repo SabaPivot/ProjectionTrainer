@@ -1,23 +1,22 @@
 #! /bin/bash
 
 export CUDA_VISIBLE_DEVICES=1,2,3 # Adjust GPU IDs as needed
-
 # --- Configuration --- #
-RUN_NAME="VD_Class_20_lr5e-5_gemma3_vit-l-384-QA_BALANCED" # Choose a descriptive name for your run
-STAGE1_RUN_NAME="VD_Class_20_lr5e-5_gemma3_vit-l-384-QA_BALANCED" # Name of the Stage 1 run directory
+RUN_NAME="VD_Class_20_lr5e-5_cogito-v1-3b_vit-l-384-QA_BALANCED-MIMIC" # Choose a descriptive name for your run
+STAGE1_RUN_NAME="VD_Class_20_lr5e-5_cogito-v1-3b_vit-l-384-QA_BALANCED-MIMIC" # Name of the Stage 1 run directory
 
 # --- Paths --- #
 # Adjust these paths according to your setup
-TRAIN_JSON="/mnt/WHY/VLM/Deepseek/VLM-R1/QA_DATASET/Train/Atelectasis+Cardiomegaly+Effusion/QA_Balancing/transformed_train.json" #"/mnt/WHY/VLM/Deepseek/VLM-R1/QA_DATASET/Train/Only_VD/All/merged_dataset.json"
+TRAIN_JSON="/mnt/samuel/Siglip/combined_train.json" # Path to the combined JSON file
 VAL_JSON="/mnt/WHY/VLM/Deepseek/VLM-R1/QA_DATASET/Train/Atelectasis+Cardiomegaly+Effusion/QA_Balancing/transformed_val.json" # Path to your VQA JSON data
 IMAGE_ROOT="/mnt/data/CXR/NIH Chest X-rays_jpg" # Path to your images
-IMAGE_ROOT_2="/path/to/your/secondary/image/directory"  # Update this with your secondary image root path
-STAGE1_PROJECTOR_PATH="/mnt/samuel/Siglip/ProjectionTrainer/0411Stage1/0411" # Path to the saved Stage 1 projector
+IMAGE_ROOT_2="/mnt/data/CXR/physionet.org/files/mimic-cxr-jpg/2.1.0/files"  # Path to your secondary image root for MIMIC-CXR images
+STAGE1_PROJECTOR_PATH="/mnt/samuel/Siglip/ProjectionTrainer/0417Stage1" # Path to the saved Stage 1 projector
 OUTPUT_DIR="./trained_vqa_stage2/${RUN_NAME}" # Output directory for this Stage 2 run
 
 # --- Model Names --- #
 VISION_MODEL="StanfordAIMI/XraySigLIP__vit-l-16-siglip-384__webli"
-LLM_MODEL="google/gemma-3-1b-it"
+LLM_MODEL="deepcogito/cogito-v1-preview-llama-3B"
 
 # --- Hyperparameters --- #
 # Adjust these based on your GPU memory and dataset size

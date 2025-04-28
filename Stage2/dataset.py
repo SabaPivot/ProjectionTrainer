@@ -68,13 +68,21 @@ class XrayVQADataset(Dataset):
 
             # Determine which image root to use based on the image path format
             if image_filename.startswith("p") and "/" in image_filename and self.image_root_2:
-                # Second format: "p10012261/s50349409"
                 image_path = os.path.join(self.image_root_2, image_filename)
-                logger.debug(f"Using secondary image root for path: {image_path}")
+                
+                # Handle MIMIC-CXR directory structure - the path might be a directory containing .jpg files
+                if os.path.isdir(image_path):
+                    # Find all jpg files in the directory
+                    jpg_files = [f for f in os.listdir(image_path) if f.lower().endswith('.jpg')]
+                    
+                    if not jpg_files:
+                        logger.warning(f"No .jpg files found in directory: {image_path}. Skipping sample.")
+                        return self.__getitem__((idx + 1) % len(self))
+                    
+                    # Use the first jpg file (there should typically be only one)
+                    image_path = os.path.join(image_path, jpg_files[0])
             else:
-                # Original format: "images_002/images/00001836_057.jpg"
                 image_path = os.path.join(self.image_root, image_filename)
-                logger.debug(f"Using primary image root for path: {image_path}")
 
             # --- Image Processing ---
             image = Image.open(image_path).convert('RGB')
