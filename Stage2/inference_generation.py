@@ -5,8 +5,7 @@ import torch
 import logging
 import argparse
 from PIL import Image
-from transformers import AutoProcessor, AutoModel, AutoTokenizer
-from transformers import Gemma3ForCausalLM
+from transformers import AutoProcessor, AutoModel, AutoTokenizer, AutoModelForCausalLM
 from safetensors.torch import load_file
 import sys
 import json
@@ -36,7 +35,7 @@ def process_sample(sample, image_root, processor, vision_encoder, projection_lay
 
         # --- Load and Preprocess Image ---
         image = Image.open(image_path).convert('RGB')
-        img_size = processor.image_processor.size['height'] if 'height' in processor.image_processor.size else 384
+        img_size = 384
         image = image.resize((img_size, img_size))
         image_inputs = processor(images=image, return_tensors="pt")
         pixel_values = image_inputs.pixel_values.to(device, dtype=model_dtype)
@@ -262,20 +261,52 @@ if __name__ == "__main__":
         llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_path)
         if llm_tokenizer.pad_token is None:
             llm_tokenizer.pad_token = llm_tokenizer.eos_token
+            logger.info("Set tokenizer pad_token to eos_token")
+            
+        # Determine if we're using Gemma or another model
         llm_config_path = os.path.join(args.llm_path, "config.json")
         if not os.path.exists(llm_config_path):
              logger.error(f"Critical Error: 'config.json' not found in {args.llm_path}")
              sys.exit(1)
-        llm_model = Gemma3ForCausalLM.from_pretrained(
-            args.llm_path, torch_dtype=model_dtype, low_cpu_mem_usage=True, attn_implementation="eager"
-        ).to(device).eval()
+        
+        logger.info(f"Loading language model: {args.llm_path}")
+        if "gemma" in args.llm_path.lower():
+            # Import Gemma3ForCausalLM for Gemma models
+            from transformers import Gemma3ForCausalLM
+            llm_model = Gemma3ForCausalLM.from_pretrained(
+                args.llm_path,
+                torch_dtype=model_dtype,
+                low_cpu_mem_usage=True,
+                attn_implementation="eager"
+            ).to(device).eval()
+            logger.info(f"Loaded Gemma language model with attn_implementation='eager'")
+        else:
+            # Use AutoModelForCausalLM for other models (like Cogito)
+            llm_model = AutoModelForCausalLM.from_pretrained(
+                args.llm_path, 
+                torch_dtype=model_dtype, 
+                low_cpu_mem_usage=True
+            ).to(device).eval()
+            logger.info(f"Loaded language model using AutoModelForCausalLM")
+
         llm_dim = llm_model.config.hidden_size
 
         projection_layer = MLPProjector(vision_dim=vision_dim, llm_dim=llm_dim)
         projector_weights_path = os.path.join(args.projector_path, "model.safetensors")
+        # Check for .bin file if .safetensors not found
         if not os.path.exists(projector_weights_path):
-             raise FileNotFoundError(f"Projector weights not found at {projector_weights_path}")
-        proj_state_dict = load_file(projector_weights_path, device="cpu")
+            bin_path = os.path.join(args.projector_path, "projector_epoch_15.bin") # Assuming this name based on previous logs
+            if os.path.exists(bin_path):
+                projector_weights_path = bin_path
+            else:
+                raise FileNotFoundError(f"Projector weights (.safetensors or .bin) not found in {args.projector_path}")
+
+        logger.info(f"Loading projector weights from: {projector_weights_path}")
+        if projector_weights_path.endswith('.safetensors'):
+            proj_state_dict = load_file(projector_weights_path, device="cpu")
+        else:
+            proj_state_dict = torch.load(projector_weights_path, map_location="cpu")
+            
         projection_layer.load_state_dict(proj_state_dict)
         projection_layer = projection_layer.to(device, dtype=model_dtype).eval()
         logger.info("Models loaded successfully.")

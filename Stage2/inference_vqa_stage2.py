@@ -210,22 +210,35 @@ def run_inference(args):
         print(f"Answer:     {generated_text}")
         print("="*30)
 
-# Function to process a single sample
 def process_sample(sample, image_root, processor, vision_encoder, projection_layer, llm_tokenizer, llm_model, device, model_dtype, generation_args, image_root_2=None):
     """Process a single sample for visual question answering."""
     try:
         image_filename = sample.get("image")
         question_text = sample.get("problem")
         
+        if not image_filename or not question_text:
+            logger.warning(f"Skipping sample due to missing 'image' or 'problem': {sample}")
+            return None
+        
         # Determine which image root to use based on the image path format
         if image_filename.startswith("p") and "/" in image_filename and image_root_2:
             # Second format: "p10012261/s50349409"
             image_path = os.path.join(image_root_2, image_filename)
-            logger.debug(f"Using secondary image root for path: {image_path}")
+            
+            # Handle MIMIC-CXR directory structure - the path might be a directory containing .jpg files
+            if os.path.isdir(image_path):
+                # Find all jpg files in the directory
+                jpg_files = [f for f in os.listdir(image_path) if f.lower().endswith('.jpg')]
+                
+                if not jpg_files:
+                    logger.warning(f"No .jpg files found in directory: {image_path}. Skipping sample.")
+                    return None
+                
+                # Use the first jpg file (there should typically be only one)
+                image_path = os.path.join(image_path, jpg_files[0])
         else:
             # Original format: "images_002/images/00001836_057.jpg"
             image_path = os.path.join(image_root, image_filename)
-            logger.debug(f"Using primary image root for path: {image_path}")
         
         # --- Load and Preprocess Image ---
         image = Image.open(image_path).convert('RGB')
@@ -288,10 +301,8 @@ if __name__ == "__main__":
 
     # --- Input Data ---
     parser.add_argument("--input_json", type=str, required=True, help="Path to the input JSON file containing image/problem/normal_caption triplets")
-    parser.add_argument("--image_root", type=str, required=True, help="Primary root directory for images")
+    parser.add_argument("--image_root", type=str, required=True, help="Root directory where images are located (paths in JSON are relative to this)")
     parser.add_argument("--image_root_2", type=str, default=None, help="Secondary root directory for images with a different path format (e.g., 'p10012261/s50349409')")
-    # parser.add_argument("--image_path", type=str, default="/mnt/data/CXR/NIH Chest X-rays_jpg/images_001/images/00000001_000.jpg", help="Path to the input image") # Removed
-    # parser.add_argument("--question", type=str, default="Examine the chest X-ray and write a report discussing any abnormalities or notable features.", help="Question to ask about the image") # Removed
 
     # --- Device ---
     default_device = "cuda" if torch.cuda.is_available() else "cpu"

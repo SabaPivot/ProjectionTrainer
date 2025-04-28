@@ -3,6 +3,8 @@
 # Script to run Stage2 generation inference with different candidate label combinations
 # Now with integrated balanced random sampling
 
+export CUDA_VISIBLE_DEVICES=0
+
 # Define the candidate label combinations to test
 declare -a CANDIDATE_LABELS=(
     "Atelectasis, No Finding"
@@ -18,8 +20,8 @@ declare -a CANDIDATE_LABELS=(
 OUTPUT_PATH="/mnt/samuel/Siglip/filtered_formatted_Class_QA.json"
 
 # Path to the trained models
-LLM_PATH="/mnt/samuel/Siglip/ProjectionTrainer/Stage2/trained_vqa_stage2/VD_Class_20_lr5e-5_gemma3_vit-l-384-QA_BALANCED/checkpoint-epoch_4/language_model"
-PROJECTOR_PATH="/mnt/samuel/Siglip/ProjectionTrainer/Stage2/trained_vqa_stage2/VD_Class_20_lr5e-5_gemma3_vit-l-384-QA_BALANCED/checkpoint-epoch_4/projection_layer"
+LLM_PATH="/mnt/samuel/Siglip/ProjectionTrainer/Stage2/trained_vqa_stage2/VD_Class_20_lr5e-5_cogito-v1-3b_vit-l-384-QA_BALANCED-MIMIC/checkpoint-epoch_8/language_model"
+PROJECTOR_PATH="/mnt/samuel/Siglip/ProjectionTrainer/Stage2/trained_vqa_stage2/VD_Class_20_lr5e-5_cogito-v1-3b_vit-l-384-QA_BALANCED-MIMIC/checkpoint-epoch_8/projection_layer"
 
 # Create output directories
 RESULTS_DIR="generation_results_stage2"

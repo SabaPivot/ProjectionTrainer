@@ -3,7 +3,7 @@ import torch
 import logging
 import argparse
 import json
-from transformers import AutoProcessor, AutoModel, AutoTokenizer, Gemma3ForCausalLM
+from transformers import AutoProcessor, AutoModel, AutoTokenizer, AutoModelForCausalLM
 from safetensors.torch import load_file
 import sys
 # --- Add parent directory to sys.path ---
@@ -56,7 +56,14 @@ def load_pretrained_projector(projector_path):
         weights_load_path = os.path.join(model_weights_path, model_file)
 
         logger.info(f"Loading projector weights from: {weights_load_path}")
-        state_dict = load_file(weights_load_path, device="cpu") # Load to CPU
+        
+        # Check file extension and use appropriate loading method
+        if weights_load_path.endswith('.safetensors'):
+            # Use safetensors for .safetensors files
+            state_dict = load_file(weights_load_path, device="cpu") # Load to CPU
+        else:
+            # Use torch.load for .bin files
+            state_dict = torch.load(weights_load_path, map_location="cpu")
 
         # Load state dict
         projector.load_state_dict(state_dict)
@@ -144,15 +151,33 @@ def main():
 
     # --- Load Language Model --- (Load fresh, freezing handled by trainer)
     llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
-    llm_model = Gemma3ForCausalLM.from_pretrained( # For Gemma3, use eager attn implementation & Gemma3ForCausalM
-        args.llm_name,
-        torch_dtype=model_dtype,
-        low_cpu_mem_usage=True,
-        attn_implementation="eager"
-    )
+    
+    # Use AutoModelForCausalLM instead of Gemma3ForCausalLM for flexibility with different models
+    logger.info(f"Loading language model: {args.llm_name}")
+    
+    # Determine if we're using Gemma or another model
+    if "gemma" in args.llm_name.lower():
+        # Import Gemma3ForCausalLM for Gemma models
+        from transformers import Gemma3ForCausalLM
+        llm_model = Gemma3ForCausalLM.from_pretrained(
+            args.llm_name,
+            torch_dtype=model_dtype,
+            low_cpu_mem_usage=True,
+            attn_implementation="eager"
+        )
+        logger.info(f"Loaded Gemma language model with attn_implementation='eager'")
+    else:
+        # Use AutoModelForCausalLM for other models
+        llm_model = AutoModelForCausalLM.from_pretrained(
+            args.llm_name,
+            torch_dtype=model_dtype,
+            low_cpu_mem_usage=True
+        )
+        logger.info(f"Loaded language model using AutoModelForCausalLM")
+    
     # Enable gradient checkpointing after model loading
     llm_model.gradient_checkpointing_enable()
-    logger.info(f"Loaded language model: {args.llm_name} with attn_implementation='eager' and gradient_checkpointing enabled.")
+    logger.info(f"Gradient checkpointing enabled for language model.")
 
     # Handle padding token
     if llm_tokenizer.pad_token is None:
