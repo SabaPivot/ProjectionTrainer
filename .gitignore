@@ -23,3 +23,5 @@ Stage2/trained_vqa_stage2/
 *.json
 
 *.csv
+
+Multicore-TSNE/
