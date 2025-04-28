@@ -24,8 +24,9 @@ logger = logging.getLogger(__name__)
 # This aligns with the CheXagent paper's description.
 class XrayTextPairDataset(Dataset):
     """Dataset for X-ray images and their text descriptions (captions/reports) from JSON"""
-    def __init__(self, image_root, json_file, processor, tokenizer, img_size, max_length=512):
+    def __init__(self, image_root, json_file, processor, tokenizer, img_size, max_length=512, image_root_2=None):
         self.image_root = image_root
+        self.image_root_2 = image_root_2
         self.img_size = img_size
         self.processor = processor
         self.tokenizer = tokenizer
@@ -56,7 +57,16 @@ class XrayTextPairDataset(Dataset):
             sample = self.samples[idx]
             image_filename = sample["image"]
             normal_caption = sample["normal_caption"] # Target text
+
+            # Try primary image root first
             image_path = os.path.join(self.image_root, image_filename)
+            if not os.path.exists(image_path) and self.image_root_2:
+                # If not found and secondary root exists, try secondary
+                image_path = os.path.join(self.image_root_2, image_filename)
+
+            # Check if file exists after trying both paths
+            if not os.path.exists(image_path):
+                 raise FileNotFoundError(f"Image not found in either root: {image_filename}")
 
             image = Image.open(image_path).convert('RGB')
             image = image.resize((self.img_size, self.img_size))
@@ -105,6 +115,7 @@ def main():
     # Updated description for Stage 1
     parser = argparse.ArgumentParser(description="Train Stage 1: Vision-Language Projector Alignment (CheXagent-style)")
     parser.add_argument("--image_root", type=str, required=True, help="Root directory with training images")
+    parser.add_argument("--image_root_2", type=str, default=None, help="Secondary root directory for images (e.g., MIMIC-CXR)")
     parser.add_argument("--train_json", type=str, required=True, help="JSON file with training image-caption/report data")
     # --- Added arguments for validation ---
     parser.add_argument("--val_json", type=str, default=None, help="JSON file with validation image-caption/report data (optional, overrides train_val_split)")
@@ -239,6 +250,7 @@ def main():
             processor,
             llm_tokenizer,
             img_size=args.img_size,
+            image_root_2=args.image_root_2
         )
         train_dataset.samples = train_samples # Directly assign split samples
         logger.info(f"Created training dataset with {len(train_dataset)} samples.")
@@ -252,6 +264,7 @@ def main():
                 processor,
                 llm_tokenizer,
                 img_size=args.img_size,
+                image_root_2=args.image_root_2
             )
             val_dataset.samples = val_samples # Directly assign split samples
             logger.info(f"Created validation dataset with {len(val_dataset)} samples.")
