@@ -29,6 +29,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for embedding computation")
     parser.add_argument("--output_dir", type=str, default=".", help="Directory to save output plots")
     parser.add_argument("--n_jobs", type=int, default=-1, help="Number of cores for MulticoreTSNE (-1 uses all)")
+    parser.add_argument("--output_filename_suffix", type=str, default="", help="Suffix to append to the output PNG filename (e.g., '_epoch_1')")
     return parser.parse_args()
 
 
@@ -198,48 +199,53 @@ def main():
 
     # Map class names to integers for coloring
     unique_classes = df_plot['normal_caption'].unique()
-    class_to_int = {cls_name: i for i, cls_name in enumerate(unique_classes)}
+    class_to_int = {cls: i for i, cls in enumerate(unique_classes)}
+    # --- Debugging line added by AI ---
+    print("DEBUG: Unique classes found in data for plotting:", unique_classes)
+    # --- End Debugging line ---
     df_plot['class_int'] = df_plot['normal_caption'].map(class_to_int)
-    n_classes = len(unique_classes)
+    # --- Debugging line added by AI ---
+    print("DEBUG: Unique integer values assigned to classes:", df_plot['class_int'].unique())
+    # --- End Debugging line ---
 
-    # plot number of abnormalities
-    # fig, axes = plt.subplots(1, 2 if proj_feats is not None else 1, figsize=(14, 6))
+    # Plotting
+    print("Plotting t-SNE...")
+    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+    scatter = ax.scatter(
+        df_plot['tsne_raw_1'], df_plot['tsne_raw_2'],
+        c=df_plot['class_int'],
+        cmap='tab10',  # Use a colormap suitable for categorical data
+        s=10, alpha=0.7
+    )
+    # Create a legend
+    legend_handles = [plt.Line2D([0], [0], marker='o', color='w', label=cls,
+                              markerfacecolor=plt.cm.tab10(class_to_int[cls]), markersize=10)
+                      for cls in unique_classes]
+    ax.legend(handles=legend_handles, title="Classes")
+    ax.set_title(f"t-SNE of Raw Embeddings ({args.model_name.split('/')[-1]})")
+    ax.set_xlabel("t-SNE Dimension 1")
+    ax.set_ylabel("t-SNE Dimension 2")
+    # Construct filename with suffix
+    raw_plot_filename = f"tsne_class_distribution_raw{args.output_filename_suffix}.png"
+    raw_plot_path = os.path.join(args.output_dir, raw_plot_filename)
+    plt.savefig(raw_plot_path, bbox_inches='tight', dpi=300)
+    print(f"Saved raw t-SNE plot to {raw_plot_path}")
+    plt.close(fig)
+
     # if proj_feats is not None:
-    #     ax_raw, ax_proj = axes
-    # else:
-    #     ax_raw = axes
-
-    # Plot only raw embeddings
-    fig, ax_raw = plt.subplots(1, 1, figsize=(8, 6)) # Adjusted figure size
-
-    # Use a qualitative colormap like 'tab10' or 'viridis'/'plasma' if many classes
-    cmap = plt.get_cmap('viridis', n_classes)
-    sc1 = ax_raw.scatter(df_plot['tsne_raw_1'], df_plot['tsne_raw_2'],
-                         c=df_plot['class_int'], cmap=cmap, alpha=0.7)
-    ax_raw.set_title('t-SNE (Raw Image Embeddings)')
-    ax_raw.set_xlabel('t-SNE 1')
-    ax_raw.set_ylabel('t-SNE 2')
-
-    # if proj_feats is not None:
-    #     sc2 = ax_proj.scatter(df_plot['tsne_proj_1'], df_plot['tsne_proj_2'],
-    #                            c=df_plot['class_int'], cmap=cmap, alpha=0.7)
-    #     ax_proj.set_title('t-SNE (Projected Embeddings)')
-    #     ax_proj.set_xlabel('t-SNE 1')
-    #     ax_proj.set_ylabel('t-SNE 2')
-
-    # Add legend
-    handles = [plt.Line2D([0], [0], marker='o', color='w', label=cls_name,
-                          markerfacecolor=cmap(i), markersize=8) for i, cls_name in enumerate(unique_classes)]
-    # if proj_feats is not None:
-    #     fig.legend(handles=handles, title="Class", loc='center right', bbox_to_anchor=(1.05, 0.5))
-
-    # Place legend inside the axes
-    ax_raw.legend(handles=handles, title="Class", loc='best')
-
-    plt.tight_layout() # Use standard tight_layout
-    out_path = os.path.join(args.output_dir, 'tsne_class_distribution_raw_only.png') # Change output filename
-    plt.savefig(out_path)
-    print(f"Saved t-SNE plot to {out_path}")
+    #     fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+    #     scatter = ax.scatter(
+    #         df_plot['tsne_proj_1'], df_plot['tsne_proj_2'],
+    #         c=df_plot['class_int'],
+    #         cmap='viridis',
+    #         s=10, alpha=0.7
+    #     )
+    #     legend = ax.legend(*scatter.legend_elements(), title="Classes")
+    #     ax.add_artist(legend)
+    #     ax.set_title("t-SNE of Projected Embeddings")
+    #     plt.savefig(os.path.join(args.output_dir, "tsne_projected_embeddings.png"), bbox_inches='tight', dpi=300)
+    #     print(f"Saved projected t-SNE plot to {os.path.join(args.output_dir, 'tsne_projected_embeddings.png')}")
+    #     plt.close(fig)
 
 if __name__ == '__main__':
     main()
