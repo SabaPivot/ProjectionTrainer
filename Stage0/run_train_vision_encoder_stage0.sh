@@ -9,14 +9,14 @@ TRUST_REMOTE_CODE_FLAG="--trust_remote_code" # Add this flag if the model requir
 
 # --- Dataset (Image-Text Pairs) ---
 # Paper uses 1,052,257 image-text pairs from CheXinstruct.
-TRAIN_JSON="/home/compu/DATA/CXR_VDQA/Train/formatted_VD_class.json"
+TRAIN_JSON="/home/compu/samuel/ProjectionTrainer/Stage1/data/single_label_image_caption_modified.json" # "/home/compu/samuel/ProjectionTrainer/Stage0/combined_transformed_data.json"
 IMAGE_ROOT="/home/compu/DATA/NIH Chest X-rays_jpg"
 
 # --- Training Hyperparameters ---
 BATCH_SIZE=8
-LEARNING_RATE=1e-4
+LEARNING_RATE=3e-5
 WEIGHT_DECAY=0.01
-NUM_EPOCHS=10
+NUM_EPOCHS=30
 GRAD_ACCUM_STEPS=4
 WARMUP_RATIO=0.05
 MAX_TEXT_LEN=128
