@@ -289,6 +289,7 @@ def main():
         processor=processor,
         tokenizer=llm_tokenizer,
         train_dataset=train_dataset,
+        val_dataset=val_dataset,  # Add validation dataset
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
@@ -366,27 +367,41 @@ def main():
                 labels = batch["labels"] # Keep on CPU for decoding reference text? Or move to device? Needs tokenizer decode later.
                 # label_token_ids = batch["token_ids"] # Original token IDs for reference decoding
 
-                # Get image embeddings
-                vision_outputs = unwrapped_vision(pixel_values=pixel_values, output_hidden_states=False)
-                image_embeds = vision_outputs.last_hidden_state # Assuming this is the right output
+                # Get image embeddings by accessing the vision_model component
+                if hasattr(unwrapped_vision, 'vision_model'):
+                    vision_tower = unwrapped_vision.vision_model
+                else:
+                    logger.warning("Could not find 'vision_model' attribute in unwrapped_vision. Assuming it's the vision tower itself.")
+                    vision_tower = unwrapped_vision # Fallback
+                    
+                vision_outputs = vision_tower(
+                    pixel_values=pixel_values, 
+                    output_hidden_states=False,
+                    return_dict=True
+                )
+                # Assuming SigLIP-like output, discard CLS token embedding if needed
+                # Check the structure of vision_outputs if unsure
+                patch_embeddings = vision_outputs.last_hidden_state[:, 1:, :] 
 
                 # Project embeddings
-                projected_embeds = unwrapped_proj(image_embeds)
+                projected_embeds = unwrapped_proj(patch_embeddings)
 
                 # Prepare inputs for LLM generation (need input_ids for prefix/prompt if applicable, or just embeddings)
                 # Here we assume direct generation from projected embeds. May need adjustment.
                 # This simplified approach might need dummy input_ids for some architectures.
-                # Let's create minimal input_ids (e.g., BOS token) and use inputs_embeds.
                 batch_size = projected_embeds.shape[0]
                 dummy_input_ids = torch.full((batch_size, 1), llm_tokenizer.bos_token_id, dtype=torch.long, device=device)
                 
-                # Get LLM's embedding layer to potentially concatenate BOS embedding
-                inputs_embeds = projected_embeds # Use projected embeds directly as input
+                # Prepare inputs for LLM generation using only projected embeds
+                inputs_embeds = projected_embeds 
+                # Create attention mask for the visual embeddings (all ones)
+                attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
 
                 # Generate text
                 # Adjust max_new_tokens as needed
                 generated_ids = unwrapped_llm.generate(
                     inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask, # Provide attention mask
                     # input_ids=dummy_input_ids, # Use this if inputs_embeds must be combined with token_ids
                     max_new_tokens=64, # Limit generation length
                     num_beams=1, # Use greedy decoding for speed, or adjust for beam search

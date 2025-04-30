@@ -10,6 +10,7 @@ from transformers import get_cosine_schedule_with_warmup
 import json
 from PIL import Image # Added for validation image loading
 import time
+import re
 
 # Setup logger for this module
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ class ProjectionTrainerStage1:
         processor, # Image processor
         tokenizer, # LLM tokenizer
         train_dataset,
+        val_dataset=None, # Added validation dataset parameter
         output_dir="./trained_projection_stage1",
         batch_size=8,
         learning_rate=1e-4,
@@ -46,6 +48,7 @@ class ProjectionTrainerStage1:
         self.batch_size = batch_size
         self.wandb_project = wandb_project
         self.save_every_n_epochs = save_every_n_epochs # Store the value
+        self.val_dataset = val_dataset # Store validation dataset
 
         if self.accelerator.is_main_process:
             os.makedirs(output_dir, exist_ok=True)
@@ -56,6 +59,17 @@ class ProjectionTrainerStage1:
             shuffle=True,
             num_workers=2
         )
+        
+        # Create validation dataloader if validation dataset exists
+        self.val_loader = None
+        if self.val_dataset is not None:
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=2
+            )
+            logger.info(f"Created validation dataloader with {len(self.val_loader)} batches")
 
         # Optimizer targets only the projection layer parameters
         self.optimizer = optim.AdamW(
@@ -87,6 +101,10 @@ class ProjectionTrainerStage1:
             self.projection_layer, self.optimizer, self.train_loader, self.lr_scheduler
         )
         
+        # Prepare validation loader if it exists
+        if self.val_loader is not None:
+            self.val_loader = self.accelerator.prepare(self.val_loader)
+        
         # Prepare frozen models individually using prepare_model for device placement/wrapping only
         self.vision_encoder = self.accelerator.prepare_model(self.vision_encoder, device_placement=True)
         self.language_model = self.accelerator.prepare_model(self.language_model, device_placement=True)
@@ -109,6 +127,14 @@ class ProjectionTrainerStage1:
 
         global_step = 0
         best_val_loss = float('inf') # Initialize best validation loss tracking
+
+        # Import the helper function for last word comparison
+        def get_last_word(text):
+            if not text or not isinstance(text, str):
+                return ""
+            # Find all word characters sequences
+            words = re.findall(r'\b\w+\b', text.lower())
+            return words[-1] if words else ""
 
         for epoch in range(self.num_epochs):
             self.projection_layer.train() # Set projector to train mode
@@ -264,89 +290,163 @@ class ProjectionTrainerStage1:
                 if self.save_every_n_epochs > 0 and (epoch + 1) % self.save_every_n_epochs == 0:
                     self.save_projection(epoch=epoch+1)
 
-            # --- Validation Step (on main process only) ---
-            if self.accelerator.is_main_process:
-                logger.info(f"Running validation inference for Epoch {epoch+1}...")
+            # --- Validation Loop ---
+            if self.val_loader is not None:
                 self.projection_layer.eval()
-                self.language_model.eval() # Ensure LLM is in eval for generation
-                # Vision encoder should already be in eval mode
-
-                val_image_path = "/home/compu/samuel/Siglip/images/001.png"
-                max_new_tokens_val = 128 # Limit generated tokens for validation output
-
-                try:
-                    with torch.no_grad():
-                        # --- Load and Process Validation Image ---
-                        image = Image.open(val_image_path).convert('RGB')
-                        if hasattr(self.processor, 'size'):
-                            img_size = self.processor.size.get("shortest_edge", self.processor.size.get("height", 384))
-                        else:
-                            logger.warning("Cannot determine processor size reliably, assuming 384x384 for validation.")
-                            img_size = 384
-                        image = image.resize((img_size, img_size))
-                        image_inputs = self.processor(images=image, return_tensors="pt").to(self.device)
-                        pixel_values_val = image_inputs.pixel_values
-
-                        # --- Validation Inference (Generate Text) ---
+                self.vision_encoder.eval()
+                self.language_model.eval()
+                
+                val_loss = 0.0
+                val_steps = 0
+                total_samples = 0
+                correct_last_word = 0
+                
+                logger.info(f"Running validation for Epoch {epoch+1}...")
+                
+                with torch.no_grad():
+                    for val_batch in tqdm(
+                        self.val_loader, 
+                        desc=f"Epoch {epoch+1}/{self.num_epochs} [Validation]",
+                        disable=not self.accelerator.is_main_process
+                    ):
+                        pixel_values = val_batch["pixel_values"]
+                        token_ids = val_batch["token_ids"]
+                        labels = val_batch["labels"]
+                        
+                        # Get visual features
                         vision_dtype = next(self.vision_encoder.parameters()).dtype
-                        if hasattr(self.vision_encoder, 'module'):
-                             vision_tower = self.vision_encoder.module.vision_model
-                        else:
-                            vision_tower = self.vision_encoder.vision_model
-                        vision_outputs = vision_tower(
-                            pixel_values=pixel_values_val.to(vision_dtype),
-                            output_hidden_states=False, return_dict=True
-                        )
-                        patch_embeddings = vision_outputs.last_hidden_state[:, 1:, :]
+                        try:
+                            if self.accelerator.num_processes > 1 and hasattr(self.vision_encoder, 'module'):
+                                vision_tower = self.vision_encoder.module.vision_model
+                            else:
+                                vision_tower = self.vision_encoder.vision_model
+
+                            vision_outputs = vision_tower(
+                                pixel_values=pixel_values.to(vision_dtype),
+                                output_hidden_states=False,
+                                return_dict=True
+                            )
+                            patch_embeddings = vision_outputs.last_hidden_state[:, 1:, :]
+                        except Exception as e:
+                            logger.error(f"Error getting vision embeddings in validation: {e}", exc_info=True)
+                            continue
+
+                        # Project visual features
                         projected_embeds = self.projection_layer(patch_embeddings)
 
-                        # Prepare attention mask for generation (all ones for visual input)
-                        inputs_embeds = projected_embeds
-                        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=self.device)
+                        # Prepare LLM inputs
+                        if self.accelerator.num_processes > 1 and hasattr(self.language_model, 'module'):
+                            word_embeddings_module = self.language_model.module.get_input_embeddings()
+                        else:
+                            word_embeddings_module = self.language_model.get_input_embeddings()
 
-                        # Generate text using LLM
-                        # Use simple generation parameters for validation output
-                        outputs = self.language_model.generate(
-                            inputs_embeds=inputs_embeds,
-                            attention_mask=attention_mask,
-                            max_new_tokens=max_new_tokens_val,
-                            pad_token_id=self.tokenizer.pad_token_id,
-                            eos_token_id=self.tokenizer.eos_token_id,
-                            do_sample=False # Use greedy decoding for consistent validation output
+                        label_embeds = word_embeddings_module(token_ids)
+                        combined_embeds = torch.cat([projected_embeds, label_embeds], dim=1)
+
+                        # Prepare attention mask and labels
+                        num_visual_tokens = projected_embeds.size(1)
+                        visual_attention_mask = torch.ones(
+                            (labels.shape[0], num_visual_tokens),
+                            dtype=torch.long, device=self.device
+                        )
+                        text_attention_mask = (token_ids != self.tokenizer.pad_token_id).long()
+                        if self.tokenizer.pad_token_id is None:
+                            text_attention_mask = torch.ones_like(token_ids, dtype=torch.long, device=self.device)
+
+                        extended_attention_mask = torch.cat([visual_attention_mask, text_attention_mask], dim=1)
+                        visual_labels = torch.full(
+                            (labels.shape[0], num_visual_tokens), fill_value=-100, dtype=labels.dtype, device=self.device
+                        )
+                        lm_labels = torch.cat([visual_labels, labels], dim=1)
+
+                        # Forward pass through LLM for loss
+                        outputs = self.language_model(
+                            inputs_embeds=combined_embeds,
+                            attention_mask=extended_attention_mask,
+                            labels=lm_labels,
+                            return_dict=True,
+                            output_hidden_states=False
                         )
                         
-                        # Decode generated tokens (generate returns only new tokens when using inputs_embeds)
-                        generated_ids = outputs[0] 
-                        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-                        # Log the generated text
-                        logger.info(f"Epoch {epoch+1}/{self.num_epochs} - Validation Image ({os.path.basename(val_image_path)}) Generated Text:\n{generated_text}")
+                        # Get loss
+                        batch_loss = outputs.loss
+                        val_loss += batch_loss.item()
+                        val_steps += 1
                         
-                        # Log to WandB if enabled
-                        if self.accelerator.trackers:
-                             try:
-                                 # Log as text to WandB table
-                                 val_table_data = [[epoch+1, global_step, os.path.basename(val_image_path), generated_text]]
-                                 # Check if tracker exists before logging
-                                 if "wandb" in self.accelerator.trackers:
-                                     wandb_tracker = self.accelerator.get_tracker("wandb")
-                                     if wandb_tracker is not None:
-                                         # Ensure wandb is imported if using wandb directly
-                                         import wandb 
-                                         val_table = wandb.Table(columns=["Epoch", "Step", "Image", "Generated Text"], data=val_table_data)
-                                         wandb_tracker.log({"validation_generations": val_table})
-                                 else:
-                                     logger.warning("Wandb tracker not found, cannot log validation table.")
-                                
-                             except Exception as log_e:
-                                 logger.warning(f"Could not log validation text to WandB: {log_e}")
-
-                except FileNotFoundError:
-                     logger.error(f"Validation image not found at {val_image_path}. Skipping validation.")
-                except Exception as e:
-                     logger.error(f"Error during validation inference step: {e}", exc_info=True)
-                finally:
-                    # Ensure model is back in training mode
+                        # --- Generate text for accuracy computation ---
+                        # Unwrap models if needed for generation
+                        if self.accelerator.num_processes > 1:
+                            unwrapped_llm = self.accelerator.unwrap_model(self.language_model)
+                            unwrapped_proj = self.accelerator.unwrap_model(self.projection_layer)
+                        else:
+                            unwrapped_llm = self.language_model
+                            unwrapped_proj = self.projection_layer
+                        
+                        # Generate text from just the projected embeddings
+                        try:
+                            # Generate text using LLM
+                            generated_ids = unwrapped_llm.generate(
+                                inputs_embeds=projected_embeds,
+                                attention_mask=visual_attention_mask,
+                                max_new_tokens=64,
+                                do_sample=False,
+                                pad_token_id=self.tokenizer.pad_token_id,
+                                eos_token_id=self.tokenizer.eos_token_id
+                            )
+                            
+                            # Decode generated text and reference text
+                            generated_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                            
+                            # Decode reference captions from token_ids
+                            reference_texts = self.tokenizer.batch_decode(token_ids.cpu().numpy(), skip_special_tokens=True)
+                            
+                            # Compare last words
+                            for ref_text, gen_text in zip(reference_texts, generated_texts):
+                                ref_last = get_last_word(ref_text)
+                                gen_last = get_last_word(gen_text)
+                                if ref_last and gen_last and ref_last == gen_last:
+                                    correct_last_word += 1
+                                total_samples += 1
+                        except Exception as e:
+                            logger.error(f"Error during generation for accuracy calculation: {e}", exc_info=True)
+                
+                # Calculate average validation loss and accuracy
+                avg_val_loss = val_loss / val_steps if val_steps > 0 else float('inf')
+                last_word_accuracy = (correct_last_word / total_samples) * 100 if total_samples > 0 else 0.0
+                
+                # Check if this is the best validation loss
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    # Save best model if it's the best so far
+                    if self.accelerator.is_main_process:
+                        self.save_projection(epoch=epoch+1, is_best=True)
+                
+                # Log validation results
+                if self.accelerator.is_main_process:
+                    logger.info(f"Epoch {epoch+1}/{self.num_epochs} validation loss: {avg_val_loss:.4f}, last word accuracy: {last_word_accuracy:.2f}% ({correct_last_word}/{total_samples})")
+                    if self.accelerator.trackers:
+                        val_log_dict = {
+                            "validation/loss": avg_val_loss,
+                            "validation/last_word_accuracy": last_word_accuracy,
+                            "epoch": epoch + 1
+                        }
+                        self.accelerator.log(val_log_dict, step=global_step)
+                        
+                        # Log to WandB if available
+                        if "wandb" in self.accelerator.trackers:
+                            try:
+                                import wandb
+                                wandb.log({
+                                    "validation/loss": avg_val_loss,
+                                    "validation/last_word_accuracy": last_word_accuracy,
+                                    "epoch": epoch + 1,
+                                    "step": global_step
+                                })
+                            except Exception as e:
+                                logger.warning(f"Could not log validation metrics to WandB: {e}")
+                
+                # Set back to training mode if not done with training
+                if epoch + 1 < self.num_epochs:
                     self.projection_layer.train()
 
         # --- End of Training --- # (Save final model)
@@ -354,21 +454,20 @@ class ProjectionTrainerStage1:
         self.save_projection(epoch=self.num_epochs) # Save final projector
         logger.info(f"Final trained projector saved to {self.output_dir}")
 
-    def save_projection(self, epoch=None):
+    def save_projection(self, epoch=None, is_best=False):
         """Save the trained projection layer state dictionary."""
-        # Simplified save approach that avoids wait_for_everyone() and long timeouts
-        
         # Only the main process saves the model
         if self.accelerator.is_main_process:
             # Allow a short pause (1-2 seconds) for other processes to sync up naturally
-            # This avoids immediate saving while other processes might still be finishing tasks
             time.sleep(2)
             
             # Unwrap the model to get the raw nn.Module for saving
             unwrapped_projection_layer = self.accelerator.unwrap_model(self.projection_layer)
             
             # Determine filename
-            if epoch is not None:
+            if is_best:
+                save_filename = "projector_best.bin"
+            elif epoch is not None:
                 save_filename = f"projector_epoch_{epoch}.bin"
             else:
                 save_filename = "projector_final.bin"
