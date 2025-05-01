@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Base directory containing epoch folders
-BASE_MODEL_DIR="/home/compu/samuel/ProjectionTrainer/Stage0/trained_vision_encoder_stage0/SigLIP_FineTune_XraySigLIP__vit-l-16-siglip-384__webli_lr3e-5_bs8_ep30_20250425_113227"
+BASE_MODEL_DIR="/home/compu/samuel/ProjectionTrainer/Stage0/trained_vision_encoder_stage0/SigLIP_FineTune_XraySigLIP__vit-b-16-siglip-512__webli_lr3e-5_bs8_ep30_20250501_095423"
 
 # Check if the base directory exists
 if [ ! -d "$BASE_MODEL_DIR" ]; then
