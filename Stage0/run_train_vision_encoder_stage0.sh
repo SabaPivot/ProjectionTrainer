@@ -3,13 +3,11 @@
 # --- Configuration for Stage 0: Vision Encoder SigLIP Fine-tuning ---
 
 # --- Model ---
-# Paper uses SigLIP-Large (ViT-L/16) pre-trained on WebLi, extended to 512 input.
-MODEL_NAME="StanfordAIMI/XraySigLIP__vit-l-16-siglip-384__webli"
+MODEL_NAME="StanfordAIMI/XraySigLIP__vit-b-16-siglip-512__webli"
 TRUST_REMOTE_CODE_FLAG="--trust_remote_code" # Add this flag if the model requires it
 
 # --- Dataset (Image-Text Pairs) ---
-# Paper uses 1,052,257 image-text pairs from CheXinstruct.
-TRAIN_JSON="/home/compu/samuel/ProjectionTrainer/Stage1/data/single_label_image_caption_modified.json" # "/home/compu/samuel/ProjectionTrainer/Stage0/combined_transformed_data.json"
+TRAIN_JSON="/home/compu/samuel/ProjectionTrainer/Stage1/data/single_label_image_caption.json" # "/home/compu/samuel/ProjectionTrainer/Stage0/combined_transformed_data.json"" # "/home/compu/samuel/ProjectionTrainer/Stage0/combined_transformed_data.json"
 IMAGE_ROOT="/home/compu/DATA/NIH Chest X-rays_jpg"
 
 # --- Training Hyperparameters ---
@@ -20,14 +18,6 @@ NUM_EPOCHS=30
 GRAD_ACCUM_STEPS=4
 WARMUP_RATIO=0.05
 MAX_TEXT_LEN=128
-
-# --- Freezing Strategy ---
-# By default, text encoder and logit scale are frozen
-# We can optionally unfreeze with these flags
-# FREEZE_FLAGS="--no_freeze_text_encoder"  # Uncomment to train text encoder
-# FREEZE_FLAGS="--no_freeze_logit_scale"   # Uncomment to train logit scale
-FREEZE_FLAGS=""  # No flags means keep defaults (freeze both)
-FREEZE_LAYERS_RATIO=0.0 # 0.0 = train all vision layers
 
 # --- Output & Logging ---
 RUN_NAME="SigLIP_FineTune_$(basename $MODEL_NAME)_lr${LEARNING_RATE}_bs${BATCH_SIZE}_ep${NUM_EPOCHS}_$(date +%Y%m%d_%H%M%S)"
@@ -64,8 +54,6 @@ accelerate launch --num_processes $NUM_GPUS --mixed_precision "$MIXED_PRECISION"
     --num_epochs $NUM_EPOCHS \
     --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
     --warmup_ratio $WARMUP_RATIO \
-    --freeze_layers_ratio $FREEZE_LAYERS_RATIO \
-    $FREEZE_FLAGS \
     --save_every_n_epochs $SAVE_EVERY \
     --logging_steps $LOGGING_STEPS \
     --log_with "$LOG_WITH" \
