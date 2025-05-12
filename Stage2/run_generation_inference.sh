@@ -19,9 +19,11 @@ declare -a CANDIDATE_LABELS=(
 # Path to the filtered dataset
 OUTPUT_PATH="/mnt/samuel/Siglip/filtered_formatted_Class_QA.json"
 
-# Path to the trained models
-LLM_PATH="/mnt/samuel/Siglip/ProjectionTrainer/Stage2/trained_vqa_stage2/VD_Class_20_lr5e-5_cogito-v1-3b_vit-l-384-QA_BALANCED-MIMIC/checkpoint-epoch_8/language_model"
-PROJECTOR_PATH="/mnt/samuel/Siglip/ProjectionTrainer/Stage2/trained_vqa_stage2/VD_Class_20_lr5e-5_cogito-v1-3b_vit-l-384-QA_BALANCED-MIMIC/checkpoint-epoch_8/projection_layer"
+# --- Paths to the trained models --- #
+# !! IMPORTANT: Set BASE_LLM_NAME to the model used for training the adapters below !!
+BASE_LLM_NAME="Qwen/Qwen3-8B" # Placeholder - CHANGE IF NEEDED
+ADAPTER_PATH="/mnt/samuel/Siglip/ProjectionTrainer/Stage2/trained_vqa_stage2/VD_Class_20_lr5e-5_QWEN3-8B-QLoRA_vit-l-384-QA_BALANCED-MIMIC/checkpoint-epoch_3/language_model"
+PROJECTOR_PATH="/mnt/samuel/Siglip/ProjectionTrainer/Stage1/trained_projection_stage1/VD_lr3e-5_qwen3-8b-QLoRA-Load_l-384-10"
 
 # Create output directories
 RESULTS_DIR="generation_results_stage2"
@@ -62,7 +64,8 @@ for candidate_labels in "${CANDIDATE_LABELS[@]}"; do
     echo "Running generation inference for: $candidate_labels using balanced sample"
     python "$SCRIPT_DIR/inference_generation.py" \
     --vision_model_name "StanfordAIMI/XraySigLIP__vit-l-16-siglip-384__webli" \
-    --llm_path "$LLM_PATH" \
+    --base_llm_name "$BASE_LLM_NAME" \
+    --adapter_path "$ADAPTER_PATH" \
     --projector_path "$PROJECTOR_PATH" \
     --input_json "$balanced_output_path" \
     --image_root "/mnt/data/CXR/NIH Chest X-rays_jpg" \

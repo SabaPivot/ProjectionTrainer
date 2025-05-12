@@ -6,6 +6,7 @@ import logging
 import argparse
 from PIL import Image
 from transformers import AutoProcessor, AutoModel, AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 from safetensors.torch import load_file
 import sys
 import json
@@ -22,7 +23,7 @@ from Stage1.projectors import MLPProjector
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def process_sample(sample, image_root, processor, vision_encoder, projection_layer, llm_tokenizer, llm_model, device, model_dtype, max_length=128):
+def process_sample(sample, image_root, processor, vision_encoder, projection_layer, tokenizer, llm, device, model_dtype, max_length=128):
     """Loads image, runs inference for one sample dict from JSON."""
     try:
         image_rel_path = sample.get("image")
@@ -58,14 +59,14 @@ def process_sample(sample, image_root, processor, vision_encoder, projection_lay
             prompt = "Identify the diseases in this chest X-ray image. Provide your answer in a single word or phrase."
             
             # Tokenize prompt
-            prompt_tokens = llm_tokenizer(
+            prompt_tokens = tokenizer(
                 prompt,
                 return_tensors="pt",
                 add_special_tokens=False
             ).input_ids.to(device)
             
             # Embed prompt tokens
-            input_embed_layer = llm_model.get_input_embeddings()
+            input_embed_layer = llm.get_input_embeddings()
             prompt_embeds = input_embed_layer(prompt_tokens)
             
             # Concatenate embeddings
@@ -74,12 +75,12 @@ def process_sample(sample, image_root, processor, vision_encoder, projection_lay
             attention_mask = torch.ones(batch_size, sequence_length, dtype=torch.long, device=device)
             
             # Generate answer
-            outputs = llm_model.generate(
+            outputs = llm.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 max_new_tokens=max_length,
-                eos_token_id=llm_tokenizer.eos_token_id,
-                pad_token_id=llm_tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
                 do_sample=True,
                 temperature=0.7,
                 top_p=0.9,
@@ -88,7 +89,7 @@ def process_sample(sample, image_root, processor, vision_encoder, projection_lay
             )
             
             # Decode the generated text
-            generated_text = llm_tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
+            generated_text = tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
             
             # Check if normal_caption appears in the generated text
             is_correct = normal_caption.lower() in generated_text.lower() if normal_caption else False
@@ -204,8 +205,9 @@ if __name__ == "__main__":
 
     # --- Model Paths ---
     parser.add_argument("--vision_model_name", type=str, default="StanfordAIMI/XraySigLIP__vit-l-16-siglip-384__webli", help="Vision encoder name/path")
-    parser.add_argument("--llm_path", type=str, required=True, help="Path to the fine-tuned LLM directory (must contain config.json)")
-    parser.add_argument("--projector_path", type=str, required=True, help="Path to the trained projector directory (containing config and weights)")
+    parser.add_argument("--base_llm_name", type=str, required=True, help="Name or path of the base LLM used for adapter training.")
+    parser.add_argument("--adapter_path", type=str, required=True, help="Path to the trained QLoRA adapter directory (language_model folder).")
+    parser.add_argument("--projector_path", type=str, required=True, help="Path to the trained projector directory (e.g., projection_layer folder containing projector_best.bin).")
 
     # --- Input Data ---
     parser.add_argument("--input_json", type=str, required=True, help="Path to the input JSON file containing image/normal_caption pairs")
@@ -221,12 +223,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # --- Validate Paths ---
-    if not os.path.isdir(args.llm_path):
-        logger.error(f"LLM path not found: {args.llm_path}")
+    if not os.path.isdir(args.adapter_path):
+        logger.error(f"Adapter path not found: {args.adapter_path}")
         sys.exit(1)
     if not os.path.isdir(args.projector_path):
         logger.error(f"Projector path not found: {args.projector_path}")
         sys.exit(1)
+    projector_weights_expected_path = os.path.join(args.projector_path, "projector_best.bin")
+    if not os.path.exists(projector_weights_expected_path):
+        logger.error(f"Projector weights file not found at expected location: {projector_weights_expected_path}")
     if not os.path.exists(args.input_json):
         logger.error(f"Input JSON file not found: {args.input_json}")
         sys.exit(1)
@@ -258,55 +263,55 @@ if __name__ == "__main__":
         ).to(device).eval()
         vision_dim = vision_encoder.config.vision_config.hidden_size
 
-        llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_path)
-        if llm_tokenizer.pad_token is None:
-            llm_tokenizer.pad_token = llm_tokenizer.eos_token
-            logger.info("Set tokenizer pad_token to eos_token")
-            
-        # Determine if we're using Gemma or another model
-        llm_config_path = os.path.join(args.llm_path, "config.json")
-        if not os.path.exists(llm_config_path):
-             logger.error(f"Critical Error: 'config.json' not found in {args.llm_path}")
-             sys.exit(1)
+        # --- Load Base LLM ---
+        logger.info(f"Loading base LLM: {args.base_llm_name}")
+        llm = AutoModelForCausalLM.from_pretrained(
+            args.base_llm_name,
+            torch_dtype=model_dtype, 
+            device_map='auto', 
+            trust_remote_code=True, 
+            low_cpu_mem_usage=True,
+        ).eval() # Set to eval mode
+        logger.info(f"Base LLM '{args.base_llm_name}' loaded.")
+
+        # --- Load Tokenizer ---
+        logger.info(f"Loading tokenizer from adapter path ({args.adapter_path}) or base ({args.base_llm_name})")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.adapter_path, trust_remote_code=True)
+            logger.info(f"Tokenizer loaded from adapter path: {args.adapter_path}")
+        except Exception:
+            logger.warning(f"Could not load tokenizer from adapter path '{args.adapter_path}'. Loading from base model '{args.base_llm_name}'.")
+            tokenizer = AutoTokenizer.from_pretrained(args.base_llm_name, trust_remote_code=True)
         
-        logger.info(f"Loading language model: {args.llm_path}")
-        if "gemma" in args.llm_path.lower():
-            # Import Gemma3ForCausalLM for Gemma models
-            from transformers import Gemma3ForCausalLM
-            llm_model = Gemma3ForCausalLM.from_pretrained(
-                args.llm_path,
-                torch_dtype=model_dtype,
-                low_cpu_mem_usage=True,
-                attn_implementation="eager"
-            ).to(device).eval()
-            logger.info(f"Loaded Gemma language model with attn_implementation='eager'")
-        else:
-            # Use AutoModelForCausalLM for other models (like Cogito)
-            llm_model = AutoModelForCausalLM.from_pretrained(
-                args.llm_path, 
-                torch_dtype=model_dtype, 
-                low_cpu_mem_usage=True
-            ).to(device).eval()
-            logger.info(f"Loaded language model using AutoModelForCausalLM")
+        # Set padding side for generation
+        tokenizer.padding_side = 'left' 
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            logger.warning("pad_token was None. Set to eos_token.")
+            llm.config.pad_token_id = tokenizer.pad_token_id # Update model config too
 
-        llm_dim = llm_model.config.hidden_size
+        # --- Load PEFT Adapters ---
+        logger.info(f"Loading PEFT adapters from: {args.adapter_path}")
+        try:
+            llm = PeftModel.from_pretrained(llm, args.adapter_path)
+            logger.info(f"QLoRA adapters loaded from {args.adapter_path}")
+        except Exception as e:
+            logger.error(f"Failed to load PEFT adapters from {args.adapter_path}: {e}", exc_info=True)
+            logger.warning("Proceeding with the base LLM without adapters.")
 
-        projection_layer = MLPProjector(vision_dim=vision_dim, llm_dim=llm_dim)
-        projector_weights_path = os.path.join(args.projector_path, "model.safetensors")
-        # Check for .bin file if .safetensors not found
-        if not os.path.exists(projector_weights_path):
-            bin_path = os.path.join(args.projector_path, "projector_epoch_15.bin") # Assuming this name based on previous logs
-            if os.path.exists(bin_path):
-                projector_weights_path = bin_path
-            else:
-                raise FileNotFoundError(f"Projector weights (.safetensors or .bin) not found in {args.projector_path}")
+        llm.eval() # Ensure model is in eval mode after adapter loading
+        llm_dim = llm.config.hidden_size
+        logger.info(f"LLM dimension after potential adapter load: {llm_dim}")
 
+        # --- Load Projector ---
+        projection_layer = MLPProjector(vision_dim=vision_dim, llm_dim=llm_dim) 
+        projector_weights_path = os.path.join(args.projector_path, "projector_best.bin")
         logger.info(f"Loading projector weights from: {projector_weights_path}")
-        if projector_weights_path.endswith('.safetensors'):
-            proj_state_dict = load_file(projector_weights_path, device="cpu")
-        else:
-            proj_state_dict = torch.load(projector_weights_path, map_location="cpu")
-            
+        if not os.path.exists(projector_weights_path):
+             # Log error but allow to continue to potentially fail later if needed
+             logger.error(f"Projector weights file not found at expected location: {projector_weights_path}") 
+        # Use torch.load for .bin files
+        proj_state_dict = torch.load(projector_weights_path, map_location="cpu") 
         projection_layer.load_state_dict(proj_state_dict)
         projection_layer = projection_layer.to(device, dtype=model_dtype).eval()
         logger.info("Models loaded successfully.")
@@ -327,47 +332,45 @@ if __name__ == "__main__":
     # --- Process Each Sample ---
     logger.info("Starting inference loop...")
     all_results = []
+    processed_count = 0
+    skipped_count = 0
     
-    for i, sample in enumerate(tqdm(data, desc="Generating", unit="image")):
-        logger.info(f"Processing sample {i+1}/{len(data)}...")
+    logger.info(f"Starting inference on {len(data)} samples from {args.input_json}...")
+    for i, sample_data in enumerate(tqdm(data, desc="Processing images")):
+        image_rel_path = sample_data.get("image")
         result = process_sample(
-            sample=sample,
-            image_root=args.image_root,
-            processor=processor,
-            vision_encoder=vision_encoder,
-            projection_layer=projection_layer,
-            llm_tokenizer=llm_tokenizer,
-            llm_model=llm_model,
-            device=device,
-            model_dtype=model_dtype,
+            sample_data, 
+            args.image_root, 
+            processor, 
+            vision_encoder, 
+            projection_layer, 
+            tokenizer, 
+            llm, 
+            device, 
+            model_dtype, 
             max_length=args.max_length
         )
+        
+        if result:
+            all_results.append(result)
+            processed_count += 1
+            # Log model answer and ground truth for each sample
+            logger.info(f"Image: {image_rel_path}, Model Answer: {result['generated_text']}, Ground Truth: {result['normal_caption']}")
+            if args.verbose:
+                display_results(result, os.path.join(args.image_root, image_rel_path), verbose=True)
+        else:
+            skipped_count += 1
+        
+        # Optional: Log progress periodically if needed
+        # if (i + 1) % 100 == 0:
+        #     logger.info(f"Processed {i + 1}/{len(data)} samples...")
 
-        if result is not None:
-            image_rel_path = sample.get("image")
-            
-            # Display individual results (if verbose)
-            display_results(result, os.path.join(args.image_root, image_rel_path), args.verbose)
-            
-            # Store results for summary
-            result_entry = {
-                'image_path': os.path.join(args.image_root, image_rel_path),
-                'generated_text': result['generated_text'],
-                'normal_caption': result['normal_caption'],
-                'is_correct': result['is_correct'],
-                'metadata': sample
-            }
-            all_results.append(result_entry)
+    logger.info(f"Inference completed. Processed: {processed_count}, Skipped: {skipped_count}")
 
-    # Display summary of all results
-    if all_results:
+    # --- Display Summary of Results ---
+    if processed_count > 0:
         display_summary(all_results, candidate_labels_list)
-        
-        # Count correct predictions (overall)
-        correct_count = sum(1 for r in all_results if r['is_correct'])
-        total_count = len(all_results)
-        accuracy = (correct_count / total_count) * 100 if total_count > 0 else 0
-        
-        print(f"\nFINAL ACCURACY: {correct_count}/{total_count} ({accuracy:.2f}%)")
+    else:
+        logger.info("No samples were processed successfully.")
 
-    logger.info("Inference loop finished.") 
+    logger.info("Script finished.") 

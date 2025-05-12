@@ -5,8 +5,9 @@ import torch
 import logging
 import argparse
 from PIL import Image
-from transformers import AutoProcessor, AutoModel, AutoTokenizer
+from transformers import AutoProcessor, AutoModel, AutoTokenizer, AutoModelForCausalLM
 from transformers import Gemma3ForCausalLM
+from peft import PeftModel
 from safetensors.torch import load_file
 import sys
 import json
@@ -50,15 +51,15 @@ def run_inference(args):
     logger.info(f"Inferred vision dimension: {vision_dim}")
 
     # --- Load Language Model Components ---
-    logger.info(f"Loading LLM tokenizer from: {args.llm_path}")
-    llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_path)
+    logger.info(f"Loading LLM tokenizer from: {args.base_llm_name}")
+    tokenizer = AutoTokenizer.from_pretrained(args.base_llm_name, trust_remote_code=True)
 
-    logger.info(f"Loading LLM using Gemma3ForCausalLM from path: {args.llm_path}")
+    logger.info(f"Loading LLM using Gemma3ForCausalLM from path: {args.base_llm_name}")
 
     # Check if config.json exists in the LLM path - STILL REQUIRED!
-    llm_config_path = os.path.join(args.llm_path, "config.json")
+    llm_config_path = os.path.join(args.base_llm_name, "config.json")
     if not os.path.exists(llm_config_path):
-        logger.error(f"Critical Error: 'config.json' not found in {args.llm_path}")
+        logger.error(f"Critical Error: 'config.json' not found in {args.base_llm_name}")
         logger.error("This is required by Gemma3ForCausalLM.from_pretrained to load the correct model architecture.")
         logger.error("The absence of config.json is the primary reason for loading failures.")
         logger.error("Please ensure the config.json from the original base LLM ('google/gemma-3-1b-it') is saved alongside the fine-tuned weights in this directory.")
@@ -66,47 +67,44 @@ def run_inference(args):
 
     # Attempt to load directly using the path and the specific Gemma3 class
     try:
-        llm_model = Gemma3ForCausalLM.from_pretrained(
-            args.llm_path,
+        llm = AutoModelForCausalLM.from_pretrained(
+            args.base_llm_name,
             torch_dtype=model_dtype,
+            device_map='auto',
+            trust_remote_code=True,
             low_cpu_mem_usage=True,
-            attn_implementation="eager" # Force eager attention
-        ).to(device).eval()
+        ).eval()
     except RuntimeError as e:
-        logger.error(f"RuntimeError loading LLM using Gemma3ForCausalLM from {args.llm_path}: {e}")
+        logger.error(f"RuntimeError loading LLM using Gemma3ForCausalLM from {args.base_llm_name}: {e}")
         logger.error("This likely means the weights in model.safetensors (or .bin) do not match the architecture defined in config.json.")
         logger.error("Verify that the config.json belongs to the model whose weights are saved here AND that the weights are compatible with Gemma3ForCausalLM.")
         sys.exit(1)
     except Exception as e:
-        logger.error(f"Failed to load LLM using Gemma3ForCausalLM from {args.llm_path}: {e}")
+        logger.error(f"Failed to load LLM using Gemma3ForCausalLM from {args.base_llm_name}: {e}")
         sys.exit(1)
 
     # Infer LLM dimension (should be correct if loading succeeded)
-    llm_dim = llm_model.config.hidden_size
+    llm_dim = llm.config.hidden_size
     logger.info(f"Inferred LLM dimension: {llm_dim}")
 
     # Handle padding token for tokenizer
-    if llm_tokenizer.pad_token is None:
-        llm_tokenizer.pad_token = llm_tokenizer.eos_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
         logger.info("Set tokenizer pad_token to eos_token")
+        llm.config.pad_token_id = tokenizer.pad_token_id
 
     # --- Load Projector ---
     logger.info(f"Loading projector from: {args.projector_path}")
     # Instantiate using inferred dimensions
     # Assuming default expansion_factor=10 from projectors.py definition
     projection_layer = MLPProjector(vision_dim=vision_dim, llm_dim=llm_dim)
-    projector_weights_path = os.path.join(args.projector_path, "model.safetensors") # Based on list_dir result
+    # Corrected projector weights file name based on list_dir result
+    projector_weights_path = os.path.join(args.projector_path, "projector_best.bin") 
     if not os.path.exists(projector_weights_path):
-        raise FileNotFoundError(f"Projector weights not found at {projector_weights_path}")
-
-    try:
-        state_dict = load_file(projector_weights_path, device="cpu") # Load weights to CPU first
-        projection_layer.load_state_dict(state_dict)
-        logger.info("Successfully loaded projector weights.")
-    except Exception as e:
-        logger.error(f"Error loading projector state_dict: {e}", exc_info=True)
-        raise
-
+         raise FileNotFoundError(f"Projector weights not found at {projector_weights_path}")
+    # Use torch.load for .bin files, map to CPU to avoid GPU memory issues during loading
+    proj_state_dict = torch.load(projector_weights_path, map_location="cpu") 
+    projection_layer.load_state_dict(proj_state_dict)
     projection_layer = projection_layer.to(device, dtype=model_dtype).eval()
 
     # --- Load and Preprocess Image ---
@@ -136,7 +134,7 @@ def run_inference(args):
     # Let's add a common pattern: "<human>: {question} <assistant>:"
     # Alternatively, use the exact format from training if known. For now, simple question tokenization.
     # We won't add BOS/EOS here as the LLM's generate method usually handles the start.
-    question_tokens = llm_tokenizer(
+    question_tokens = tokenizer(
         args.question,
         return_tensors="pt",
         add_special_tokens=False # Usually False, let embedding concatenation handle context
@@ -160,7 +158,7 @@ def run_inference(args):
         logger.info(f"Projected visual features shape: {projected_embeds.shape}")
 
         # 3. Embed Question Tokens
-        input_embed_layer = llm_model.get_input_embeddings()
+        input_embed_layer = llm.get_input_embeddings()
         question_embeds = input_embed_layer(question_tokens) # Shape: [B, SeqLen_Q, Dim_LLM]
         logger.info(f"Question embeddings shape: {question_embeds.shape}")
 
@@ -181,12 +179,12 @@ def run_inference(args):
         # Use generate method with inputs_embeds
         # max_new_tokens needs to be set appropriately.
         # Need eos_token_id for stopping criteria.
-        outputs = llm_model.generate(
+        outputs = llm.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask, # Provide the mask corresponding to inputs_embeds
             max_new_tokens=args.max_new_tokens, # Control output length
-            eos_token_id=llm_tokenizer.eos_token_id,
-            pad_token_id=llm_tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
             # Use values from args
             do_sample=args.do_sample,
             temperature=args.temperature,
@@ -199,7 +197,7 @@ def run_inference(args):
         logger.info("Generation complete.")
 
         # --- Decode and Print ---
-        generated_text = llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
         
         print("\\n" + "="*30)
@@ -210,7 +208,7 @@ def run_inference(args):
         print(f"Answer:     {generated_text}")
         print("="*30)
 
-def process_sample(sample, image_root, processor, vision_encoder, projection_layer, llm_tokenizer, llm_model, device, model_dtype, generation_args, image_root_2=None):
+def process_sample(sample, image_root, processor, vision_encoder, projection_layer, tokenizer, llm, device, model_dtype, generation_args, image_root_2=None):
     """Process a single sample for visual question answering."""
     try:
         image_filename = sample.get("image")
@@ -248,7 +246,7 @@ def process_sample(sample, image_root, processor, vision_encoder, projection_lay
         pixel_values = image_inputs.pixel_values.to(device, dtype=model_dtype)
 
         # --- Tokenize Question ---
-        question_tokens = llm_tokenizer(
+        question_tokens = tokenizer(
             question_text,
             return_tensors="pt",
             add_special_tokens=False
@@ -263,23 +261,23 @@ def process_sample(sample, image_root, processor, vision_encoder, projection_lay
             )
             patch_embeddings = vision_outputs.last_hidden_state[:, 1:, :]
             projected_embeds = projection_layer(patch_embeddings)
-            input_embed_layer = llm_model.get_input_embeddings()
+            input_embed_layer = llm.get_input_embeddings()
             question_embeds = input_embed_layer(question_tokens)
             inputs_embeds = torch.cat([projected_embeds, question_embeds], dim=1)
             batch_size, sequence_length, _ = inputs_embeds.shape
             attention_mask = torch.ones(batch_size, sequence_length, dtype=torch.long, device=device)
 
             # --- Generate Answer ---
-            outputs = llm_model.generate(
+            outputs = llm.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                eos_token_id=llm_tokenizer.eos_token_id,
-                pad_token_id=llm_tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
                 **generation_args # Pass generation kwargs dict
             )
 
             # --- Decode ---
-            generated_text = llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
+            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
             return generated_text
 
     except FileNotFoundError:
@@ -296,7 +294,8 @@ if __name__ == "__main__":
 
     # --- Model Paths ---
     parser.add_argument("--vision_model_name", type=str, default="StanfordAIMI/XraySigLIP__vit-l-16-siglip-384__webli", help="Vision encoder name/path")
-    parser.add_argument("--llm_path", type=str, required=True, help="Path to the fine-tuned LLM directory (must contain config.json)")
+    parser.add_argument("--base_llm_name", type=str, required=True, help="Name or path of the base LLM (e.g., 'Qwen/Qwen3-8B').")
+    parser.add_argument("--adapter_path", type=str, required=True, help="Path to the trained QLoRA adapter directory.")
     parser.add_argument("--projector_path", type=str, required=True, help="Path to the trained projector directory (containing config and weights)")
 
     # --- Input Data ---
@@ -321,8 +320,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # --- Validate Paths ---
-    if not os.path.isdir(args.llm_path):
-        logger.error(f"LLM path not found: {args.llm_path}")
+    if not os.path.isdir(args.adapter_path):
+        logger.error(f"Adapter path not found: {args.adapter_path}")
         sys.exit(1)
     if not os.path.isdir(args.projector_path):
         logger.error(f"Projector path not found: {args.projector_path}")
@@ -354,23 +353,60 @@ if __name__ == "__main__":
         ).to(device).eval()
         vision_dim = vision_encoder.config.vision_config.hidden_size
 
-        llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_path)
-        if llm_tokenizer.pad_token is None:
-            llm_tokenizer.pad_token = llm_tokenizer.eos_token
-        llm_config_path = os.path.join(args.llm_path, "config.json")
-        if not os.path.exists(llm_config_path):
-             logger.error(f"Critical Error: 'config.json' not found in {args.llm_path}")
-             sys.exit(1)
-        llm_model = Gemma3ForCausalLM.from_pretrained(
-            args.llm_path, torch_dtype=model_dtype, low_cpu_mem_usage=True, attn_implementation="eager"
-        ).to(device).eval()
-        llm_dim = llm_model.config.hidden_size
+        # --- Load Base LLM --- #
+        logger.info(f"Loading base LLM: {args.base_llm_name}")
+        llm = AutoModelForCausalLM.from_pretrained(
+            args.base_llm_name,
+            torch_dtype=model_dtype, # Match training dtype if possible
+            device_map='auto', # Load directly to the target device(s)
+            trust_remote_code=True,  # Necessary for some models like Qwen
+            low_cpu_mem_usage=True,
+            # Consider adding quantization config if needed for memory
+            # load_in_4bit=True,
+            # bnb_4bit_compute_dtype=torch.bfloat16
+        ).eval() # Set to eval mode
+        logger.info(f"Base LLM '{args.base_llm_name}' loaded.")
 
-        projection_layer = MLPProjector(vision_dim=vision_dim, llm_dim=llm_dim)
-        projector_weights_path = os.path.join(args.projector_path, "model.safetensors")
+        # --- Load Tokenizer --- #
+        logger.info(f"Loading tokenizer from adapter path ({args.adapter_path}) or base ({args.base_llm_name})")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.adapter_path, trust_remote_code=True)
+            logger.info(f"Tokenizer loaded from adapter path: {args.adapter_path}")
+        except Exception:
+            logger.warning(f"Could not load tokenizer from adapter path '{args.adapter_path}'. Loading from base model '{args.base_llm_name}'.")
+            tokenizer = AutoTokenizer.from_pretrained(args.base_llm_name, trust_remote_code=True)
+
+        # Set padding side for generation
+        tokenizer.padding_side = 'left'
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            logger.warning("pad_token was None. Set to eos_token.")
+            llm.config.pad_token_id = tokenizer.pad_token_id # Update model config too
+
+        # --- Load PEFT Adapters --- #
+        logger.info(f"Loading PEFT adapters from: {args.adapter_path}")
+        try:
+            llm = PeftModel.from_pretrained(llm, args.adapter_path)
+            # Optional: Merge adapters for potentially faster inference, but requires more memory
+            # llm = llm.merge_and_unload()
+            # logger.info(f"QLoRA adapters loaded and merged from {args.adapter_path}")
+            logger.info(f"QLoRA adapters loaded from {args.adapter_path}")
+        except Exception as e:
+            logger.error(f"Failed to load PEFT adapters from {args.adapter_path}: {e}", exc_info=True)
+            logger.warning("Proceeding with the base LLM without adapters.")
+            # exit() # Optional: exit if adapters are mandatory
+
+        llm.eval() # Ensure model is in eval mode after adapter loading
+        llm_dim = llm.config.hidden_size
+        logger.info(f"LLM dimension after potential adapter load: {llm_dim}")
+
+        # --- Load Projector --- (Use correct llm_dim)
+        projection_layer = MLPProjector(vision_dim=vision_dim, llm_dim=llm_dim) # Use inferred LLM dimension
+        projector_weights_path = os.path.join(args.projector_path, "projector_best.bin")
         if not os.path.exists(projector_weights_path):
              raise FileNotFoundError(f"Projector weights not found at {projector_weights_path}")
-        proj_state_dict = load_file(projector_weights_path, device="cpu")
+        # Use torch.load for .bin files, map to CPU to avoid GPU memory issues during loading
+        proj_state_dict = torch.load(projector_weights_path, map_location="cpu") 
         projection_layer.load_state_dict(proj_state_dict)
         projection_layer = projection_layer.to(device, dtype=model_dtype).eval()
         logger.info("Models loaded successfully.")
@@ -411,8 +447,8 @@ if __name__ == "__main__":
             processor=processor,
             vision_encoder=vision_encoder,
             projection_layer=projection_layer,
-            llm_tokenizer=llm_tokenizer,
-            llm_model=llm_model,
+            tokenizer=tokenizer,
+            llm=llm,
             device=device,
             model_dtype=model_dtype,
             generation_args=generation_args
