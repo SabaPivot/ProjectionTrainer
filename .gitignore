@@ -4,6 +4,8 @@ Single-Layer/
 
 wandb/
 
+trained_vision_encoder_stage0
+
 trained_projection_stage1/
 
 __pycache__/
