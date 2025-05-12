@@ -389,7 +389,7 @@ class ProjectionTrainerStage1:
                                 inputs_embeds=projected_embeds,
                                 attention_mask=visual_attention_mask,
                                 max_new_tokens=64,
-                                do_sample=False,
+                                do_sample=True,
                                 pad_token_id=self.tokenizer.pad_token_id,
                                 eos_token_id=self.tokenizer.eos_token_id
                             )
