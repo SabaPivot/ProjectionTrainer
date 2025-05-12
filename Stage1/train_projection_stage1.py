@@ -4,7 +4,7 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import logging
 import argparse
-from transformers import AutoProcessor, AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoProcessor, AutoModel, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transformers import Gemma3ForCausalLM
 import json
 from projectors import MLPProjector
@@ -53,55 +53,77 @@ class XrayTextPairDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        image_path = None # Initialize image_path for logging in case of early error
         try:
             sample = self.samples[idx]
-            image_filename = sample["image"]
+            image_filename_or_dir = sample["image"] # This might be a filename or a directory path part
             normal_caption = sample["normal_caption"] # Target text
 
-            # Try primary image root first
-            image_path = os.path.join(self.image_root, image_filename)
-            if not os.path.exists(image_path) and self.image_root_2:
-                # If not found and secondary root exists, try secondary
-                image_path = os.path.join(self.image_root_2, image_filename)
+            # Default assume primary root with direct filename
+            image_path = os.path.join(self.image_root, image_filename_or_dir)
+            is_mimic_path = False
 
-            # Check if file exists after trying both paths
+            # Check if file exists in primary root
             if not os.path.exists(image_path):
-                 raise FileNotFoundError(f"Image not found in either root: {image_filename}")
+                if self.image_root_2:
+                    # Construct potential MIMIC directory path
+                    mimic_dir_path = os.path.join(self.image_root_2, image_filename_or_dir)
+                    if os.path.isdir(mimic_dir_path):
+                        is_mimic_path = True
+                        # Find the first .jpg file in the directory
+                        try:
+                            jpg_files = [f for f in os.listdir(mimic_dir_path) if f.lower().endswith('.jpg')]
+                            if jpg_files:
+                                image_path = os.path.join(mimic_dir_path, jpg_files[0]) # Use the first JPG found
+                                logger.debug(f"Found MIMIC image: {image_path}")
+                            else:
+                                raise FileNotFoundError(f"No .jpg file found in MIMIC directory: {mimic_dir_path}")
+                        except Exception as e:
+                            raise FileNotFoundError(f"Error listing or finding JPG in {mimic_dir_path}: {e}")
+                    else:
+                        # If not a directory in root 2, maybe it's a direct file path there?
+                        image_path = mimic_dir_path # Treat as potential file path in root 2
+                else:
+                     # If not found in root 1 and no root 2, raise error
+                     raise FileNotFoundError(f"Image not found in primary root and no secondary root provided: {image_path}")
+            
+            # Final check if a valid image_path was found/constructed
+            if not os.path.exists(image_path) or os.path.isdir(image_path):
+                 # Log details if path resolution failed
+                 if is_mimic_path:
+                     details = f"Failed to resolve MIMIC path. Started with: {image_filename_or_dir}. Looked in: {os.path.join(self.image_root_2, image_filename_or_dir)}. Final invalid path: {image_path}"
+                 else:
+                     details = f"Failed to find image file. Started with: {image_filename_or_dir}. Looked in: {self.image_root}. Final invalid path: {image_path}"
+                 raise FileNotFoundError(f"Image path is invalid or a directory. {details}")
 
+            # --- Load and Process Image --- #
             image = Image.open(image_path).convert('RGB')
             image = image.resize((self.img_size, self.img_size))
             image_inputs = self.processor(images=image, return_tensors="pt")
 
-            # Tokenize the target caption/report
+            # --- Tokenize Text --- #
             text_inputs = self.tokenizer(
                 normal_caption, max_length=self.max_length, padding="max_length",
                 truncation=True, return_tensors="pt"
             )
             token_ids = text_inputs.input_ids.squeeze(0)
-
-            # Copy token_ids to labels before modifying for padding
             labels = token_ids.clone()
-
-            # Replace padding token id with -100 for loss calculation
             if self.tokenizer.pad_token_id is not None:
                 labels[labels == self.tokenizer.pad_token_id] = -100
 
-            # Return both original token IDs and the labels for loss
             return {
                 "pixel_values": image_inputs.pixel_values.squeeze(0),
-                "token_ids": token_ids, # Original IDs for embedding lookup
-                "labels": labels      # IDs with -100 for loss calculation
+                "token_ids": token_ids,
+                "labels": labels
             }
-        except FileNotFoundError:
-            # Handle missing images gracefully
-            print(f"WARNING: Image file not found for sample {idx}: {image_path}. Skipping.")
-            # Return the next valid item recursively
-            return self.__getitem__((idx + 1) % len(self))
+        except FileNotFoundError as e:
+            # Log and re-raise to make the error explicit
+            logger.error(f"ERROR (FileNotFound) processing sample {idx}: {e}")
+            raise e # Re-raise the exception
         except Exception as e:
-            # Handle other potential errors during data loading/processing
-            print(f"ERROR: Error processing sample {idx} ({image_path}): {e}")
-            # Return the next valid item recursively
-            return self.__getitem__((idx + 1) % len(self))
+            # Log and re-raise other errors
+            logger.error(f"ERROR processing sample {idx} (path was {image_path}): {e}", exc_info=True)
+            raise e # Re-raise the exception
 
 # Helper function to extract the last word
 def get_last_word(text):
@@ -117,41 +139,42 @@ def main():
     parser.add_argument("--image_root", type=str, required=True, help="Root directory with training images")
     parser.add_argument("--image_root_2", type=str, default=None, help="Secondary root directory for images (e.g., MIMIC-CXR)")
     parser.add_argument("--train_json", type=str, required=True, help="JSON file with training image-caption/report data")
-    # --- Added arguments for validation ---
     parser.add_argument("--val_json", type=str, default=None, help="JSON file with validation image-caption/report data (optional, overrides train_val_split)")
     parser.add_argument("--train_val_split", type=float, default=0.0, help="Fraction of train_json to use for validation (if val_json is not provided). Default 0 means no validation split.")
-    # parser.add_argument("--eval_every_n_epochs", type=int, default=1, help="Evaluate on validation set every N epochs (Currently only evaluates after training).") # TODO: Implement evaluation during training if ProjectorTrainer allows
-    # ---------------------------------------
     parser.add_argument("--output_dir", type=str, default="./trained_projection_stage1", help="Output directory for Stage 1 projector")
-    parser.add_argument("--vision_model_name", type=str, default="StanfordAIMI/XraySigLIP__vit-b-16-siglip-512__webli", help="Pre-trained vision encoder name or path.")
-    parser.add_argument("--llm_name", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", help="Pre-trained language model name or path.")
+    parser.add_argument("--vision_model_name", type=str, default="/mnt/samuel/Siglip/soombit/checkpoint/epoch_16", help="Pre-trained vision encoder name or path.")
+    parser.add_argument("--llm_name", type=str, default="Qwen/Qwen3-8B", help="Pre-trained language model name or path.")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size *per GPU*.")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Peak learning rate for projector")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
-    parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs for Stage 1") # Adjust default as needed
-    parser.add_argument("--warmup_ratio", type=float, default=0.0, help="Ratio of total training steps for linear warmup (e.g., 0.05)") # Added
+    parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs for Stage 1")
+    parser.add_argument("--warmup_ratio", type=float, default=0.0, help="Ratio of total training steps for linear warmup (e.g., 0.05)")
     parser.add_argument("--wandb_project", type=str, default="xray_projection_training_stage1", help="WandB project name for Stage 1")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name (optional)")
     parser.add_argument("--wandb_log_freq", type=int, default=100, help="Log gradients/params to WandB every N steps (if watched)")
     parser.add_argument("--disable_wandb", action='store_true', help="Disable Weights & Biases logging")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="Number of steps to accumulate gradients over.")
     parser.add_argument("--img_size", type=int, default=384, help="Image size")
-    parser.add_argument("--save_every_n_epochs", type=int, default=2, help="Save projector checkpoint every N epochs. Set to 0 to disable epoch checkpoints (only save at end).") # Added
+    parser.add_argument("--save_every_n_epochs", type=int, default=2, help="Save projector checkpoint every N epochs. Set to 0 to disable epoch checkpoints (only save at end).")
+    parser.add_argument("--enable_qlora", action="store_true", help="Load LLM in 4-bit using QLoRA config for memory saving (LLM remains frozen).")
 
     args = parser.parse_args()
 
     # Initialize Accelerator, logging, and trackers using the setup function
     accelerator = setup_accelerator_and_logging(args)
-    device = accelerator.device # Get device after accelerator is initialized
+    device = accelerator.device
 
     # Load Models
     logger.info(f"Process {accelerator.process_index}: Loading base models (will be frozen)...")
-    # Use bfloat16 if available and supported, otherwise float16
-    model_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-    logger.info(f"Using model dtype: {model_dtype}")
+    if accelerator.mixed_precision == "fp16":
+        model_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        model_dtype = torch.bfloat16 # Use bf16 for QLoRA compute if enabled
+    else:
+        model_dtype = torch.float32
+    logger.info(f"Using model loading dtype: {model_dtype} based on accelerator precision: {accelerator.mixed_precision}")
 
     # --- Load Vision Encoder (Frozen) ---
-    # Use the specific SigLIP model mentioned or your equivalent
     processor = AutoProcessor.from_pretrained(args.vision_model_name)
     vision_encoder = AutoModel.from_pretrained(
         args.vision_model_name,
@@ -162,29 +185,61 @@ def main():
 
     # --- Load Language Model (Frozen) ---
     llm_tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
-    if "gemma" in args.llm_name:
-        llm_model = Gemma3ForCausalLM.from_pretrained(
-            args.llm_name,
-            torch_dtype=model_dtype,
-            low_cpu_mem_usage=True
-        )
-    else:
-        llm_model = AutoModelForCausalLM.from_pretrained(
-            args.llm_name,
-            torch_dtype=model_dtype,
-            low_cpu_mem_usage=True
-        )
+    # Set padding side to left for Flash Attention compatibility during generation
+    llm_tokenizer.padding_side = 'left'
+    logger.info(f"Set tokenizer padding_side to '{llm_tokenizer.padding_side}'")
 
-    # Enable gradient checkpointing to save memory on the frozen LLM
-    llm_model.gradient_checkpointing_enable()
-    logger.info(f"Loaded language model: {args.llm_name} and enabled gradient checkpointing.")
+    quantization_config = None
+    if args.enable_qlora:
+        logger.info("Setting up QLoRA configuration for 4-bit LLM loading...")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=model_dtype, # bf16 or fp16
+            bnb_4bit_use_double_quant=True,
+        )
+        logger.info(f"BitsAndBytesConfig: {quantization_config}")
+
+    logger.info(f"Loading language model: {args.llm_name}")
+    llm_model = AutoModelForCausalLM.from_pretrained(
+        args.llm_name,
+        quantization_config=quantization_config, # Apply if QLoRA enabled
+        torch_dtype=model_dtype if quantization_config is None else None, # Load in compute dtype only if not quantizing
+        low_cpu_mem_usage=True,
+        # attn_implementation="flash_attention_2" if torch.cuda.is_available() and args.enable_qlora else None # REMOVED: Let transformers handle default attn for stability in Stage 1
+    )
+    logger.info(f"Loaded language model '{args.llm_name}'. Quantized: {args.enable_qlora}")
+
+    # LLM remains frozen in Stage 1, regardless of QLoRA loading
+    # llm_model.requires_grad_(False) # This will be handled by the trainer
+    # Enable gradient checkpointing ONLY if NOT using QLoRA (QLoRA handles it internally)
+    if not args.enable_qlora:
+        llm_model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled for full-precision LLM.")
+    else:
+        # Ensure gradient checkpointing is used with QLoRA, prepare_model... does this
+        # but we aren't calling that here as we don't apply PEFT config. Check if needed manually.
+        if hasattr(llm_model, "is_gradient_checkpointing") and not llm_model.is_gradient_checkpointing:
+             llm_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False}) # Recommended for QLoRA
+             logger.info("Explicitly enabled gradient checkpointing for QLoRA-loaded LLM.")
+        elif not hasattr(llm_model, "is_gradient_checkpointing"):
+             # If the attribute doesn't exist, try enabling anyway
+             try:
+                 llm_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False}) # Recommended for QLoRA
+                 logger.info("Enabled gradient checkpointing for QLoRA-loaded LLM (attribute check failed).")
+             except Exception as e:
+                 logger.warning(f"Could not enable gradient checkpointing for QLoRA model: {e}")
+        else:
+             logger.info("Gradient checkpointing likely already enabled for QLoRA-loaded LLM.")
 
     # Handle padding token for tokenizer and model
     if llm_tokenizer.pad_token is None:
+        # Important: Set pad_token AFTER setting padding_side
         llm_tokenizer.pad_token = llm_tokenizer.eos_token
-        llm_model.config.pad_token_id = llm_tokenizer.eos_token_id
-        if accelerator.is_main_process: logger.info("Set tokenizer pad_token to eos_token")
-
+        logger.info("Set tokenizer pad_token to eos_token")
+        # No need to set model config pad_token_id when padding_side is left and pad=eos
+        # if llm_model.config.pad_token_id is None:
+        #     llm_model.config.pad_token_id = llm_tokenizer.eos_token_id
 
     # --- Initialize Projector (Trainable) ---
     logger.info("Initializing projector (Trainable Component)...")
@@ -203,7 +258,6 @@ def main():
     intermediate_dim = vision_dim * expansion_factor
     logger.info(f"Projector Dimensions for LLM '{args.llm_name}': Vision({vision_dim}) -> Expanded({intermediate_dim}) -> LLM({llm_dim})")
     # ---------------------
-
 
     # --- Create Dataset ---
     if accelerator.is_main_process: logger.info("Creating datasets for Stage 1...")
@@ -333,114 +387,6 @@ def main():
         #     accelerator.end_training()
         #     logger.info("Ended WandB tracking run.")
         pass # Let evaluation handle final WandB end
-
-    # --- Post-Training Evaluation (if validation set exists and training succeeded) ---
-    if training_successful and val_dataset and accelerator.is_main_process: # Only run eval on main process
-        logger.info("Starting post-training evaluation on validation set...")
-        
-        # Ensure models are on the correct device and in eval mode
-        vision_encoder.to(device).eval()
-        llm_model.to(device).eval()
-        projection.to(device).eval()
-
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size, # Use same batch size or a dedicated eval batch size
-            shuffle=False # No need to shuffle for evaluation
-        )
-
-        # Prepare dataloader for accelerator
-        val_dataloader = accelerator.prepare(val_dataloader)
-
-        total_samples = 0
-        correct_last_word = 0
-        
-        # Get models needed for generation
-        unwrapped_llm = accelerator.unwrap_model(llm_model)
-        unwrapped_vision = accelerator.unwrap_model(vision_encoder)
-        unwrapped_proj = accelerator.unwrap_model(projection)
-
-
-        with torch.no_grad():
-            for batch in val_dataloader:
-                pixel_values = batch["pixel_values"].to(model_dtype) # Ensure correct dtype
-                labels = batch["labels"] # Keep on CPU for decoding reference text? Or move to device? Needs tokenizer decode later.
-                # label_token_ids = batch["token_ids"] # Original token IDs for reference decoding
-
-                # Get image embeddings by accessing the vision_model component
-                if hasattr(unwrapped_vision, 'vision_model'):
-                    vision_tower = unwrapped_vision.vision_model
-                else:
-                    logger.warning("Could not find 'vision_model' attribute in unwrapped_vision. Assuming it's the vision tower itself.")
-                    vision_tower = unwrapped_vision # Fallback
-                    
-                vision_outputs = vision_tower(
-                    pixel_values=pixel_values, 
-                    output_hidden_states=False,
-                    return_dict=True
-                )
-                # Assuming SigLIP-like output, discard CLS token embedding if needed
-                # Check the structure of vision_outputs if unsure
-                patch_embeddings = vision_outputs.last_hidden_state[:, 1:, :] 
-
-                # Project embeddings
-                projected_embeds = unwrapped_proj(patch_embeddings)
-
-                # Prepare inputs for LLM generation (need input_ids for prefix/prompt if applicable, or just embeddings)
-                # Here we assume direct generation from projected embeds. May need adjustment.
-                # This simplified approach might need dummy input_ids for some architectures.
-                batch_size = projected_embeds.shape[0]
-                dummy_input_ids = torch.full((batch_size, 1), llm_tokenizer.bos_token_id, dtype=torch.long, device=device)
-                
-                # Prepare inputs for LLM generation using only projected embeds
-                inputs_embeds = projected_embeds 
-                # Create attention mask for the visual embeddings (all ones)
-                attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
-
-                # Generate text
-                # Adjust max_new_tokens as needed
-                generated_ids = unwrapped_llm.generate(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask, # Provide attention mask
-                    # input_ids=dummy_input_ids, # Use this if inputs_embeds must be combined with token_ids
-                    max_new_tokens=64, # Limit generation length
-                    num_beams=1, # Use greedy decoding for speed, or adjust for beam search
-                    do_sample=False,
-                    pad_token_id=llm_tokenizer.pad_token_id,
-                    eos_token_id=llm_tokenizer.eos_token_id
-                )
-
-                # Decode generated text and reference text
-                generated_texts = llm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-                
-                # Decode reference captions from token_ids (ensure labels are usable)
-                # Need original token_ids, not labels with -100
-                # We need to modify the dataset or dataloader to yield original token_ids if not already present
-                # Assuming dataset __getitem__ returns "token_ids" which are original, non-masked ids.
-                label_token_ids_cpu = batch["token_ids"].cpu().numpy() # Move to CPU for decoding
-                reference_texts = llm_tokenizer.batch_decode(label_token_ids_cpu, skip_special_tokens=True)
-
-
-                # Compare last words
-                for ref_text, gen_text in zip(reference_texts, generated_texts):
-                    ref_last = get_last_word(ref_text)
-                    gen_last = get_last_word(gen_text)
-                    if ref_last and gen_last and ref_last == gen_last:
-                        correct_last_word += 1
-                    total_samples += 1 # Count per-sample comparisons
-
-        if total_samples > 0:
-            last_word_accuracy = (correct_last_word / total_samples) * 100
-            logger.info(f"Validation Complete: Last Word Accuracy = {last_word_accuracy:.2f}% ({correct_last_word}/{total_samples})")
-            # Log to WandB if enabled
-            if accelerator.trackers:
-                 try:
-                     accelerator.log({"validation/last_word_accuracy": last_word_accuracy})
-                     logger.info("Logged validation accuracy to tracker.")
-                 except Exception as e:
-                     logger.warning(f"Failed to log validation accuracy to tracker: {e}")
-        else:
-            logger.warning("No samples processed during validation.")
 
     # --- Final Cleanup ---
     # Ensure WandB run is ended cleanly if not already done
