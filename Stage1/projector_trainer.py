@@ -238,8 +238,6 @@ class ProjectionTrainerStage1:
 
                 # --- Optimizer Step ---
                 if self.accelerator.sync_gradients:
-                    # Optional gradient clipping (uncomment if needed)
-                    # TODO: Experiment with gradient clipping if training becomes unstable.
                     self.accelerator.clip_grad_norm_(self.projection_layer.parameters(), 5.0) # Enabled gradient clipping
                     self.optimizer.step()
                     self.lr_scheduler.step()
