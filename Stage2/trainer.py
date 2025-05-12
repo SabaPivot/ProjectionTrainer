@@ -15,34 +15,44 @@ from accelerate.utils import gather_object
 logger = logging.getLogger(__name__)
 
 # --- Custom Collate Function ---
-def vqa_collate_fn(batch, pad_token_id):
+def vqa_collate_fn(batch, tokenizer):
     """Collate function for VQADataset.
 
-    Pads question_input_ids and answer_input_ids to the max length in the batch. ==> Dynamic padding
-    
-    Pros: 
-    - Computational Efficiency
-    - Memory Efficiency
-
+    Pads question_input_ids and answer_input_ids based on tokenizer.padding_side.
     Stacks pixel_values.
     """
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
+    pad_token_id = tokenizer.pad_token_id
+    padding_side = tokenizer.padding_side
 
-    # Pad question_input_ids
     question_input_ids_list = [item["question_input_ids"] for item in batch]
-    question_input_ids_padded = pad_sequence(
-        question_input_ids_list,
-        batch_first=True,
-        padding_value=pad_token_id
-    )
-
-    # Pad answer_input_ids
     answer_input_ids_list = [item["answer_input_ids"] for item in batch]
-    answer_input_ids_padded = pad_sequence(
-        answer_input_ids_list,
-        batch_first=True,
-        padding_value=pad_token_id
-    )
+
+    # --- Manual Padding based on tokenizer.padding_side ---
+    def manual_pad(sequences, max_len):
+        padded_sequences = []
+        for seq_tensor in sequences:
+            seq_len = seq_tensor.shape[0]
+            pad_len = max_len - seq_len
+            if pad_len > 0:
+                padding = torch.full((pad_len,), pad_token_id, dtype=seq_tensor.dtype, device=seq_tensor.device)
+                if padding_side == 'left':
+                    padded_seq = torch.cat([padding, seq_tensor], dim=0)
+                else: # Default to right padding
+                    padded_seq = torch.cat([seq_tensor, padding], dim=0)
+            else:
+                padded_seq = seq_tensor
+            padded_sequences.append(padded_seq)
+        return torch.stack(padded_sequences)
+
+    # Determine max lengths
+    max_q_len = max(seq.shape[0] for seq in question_input_ids_list)
+    max_a_len = max(seq.shape[0] for seq in answer_input_ids_list)
+
+    # Apply manual padding
+    question_input_ids_padded = manual_pad(question_input_ids_list, max_q_len)
+    answer_input_ids_padded = manual_pad(answer_input_ids_list, max_a_len)
+    # --------------------------------------------------------
 
     return {
         "pixel_values": pixel_values,
@@ -76,6 +86,7 @@ class VQATrainerStage2:
         freeze_vision_encoder: bool,
         freeze_projection_layer: bool,
         freeze_llm: bool,
+        enable_qlora: bool,
         train_ve_first_epoch: bool,
         wandb_project: str
     ):
@@ -90,6 +101,7 @@ class VQATrainerStage2:
         self.batch_size = batch_size
         self.wandb_project = wandb_project
         self.train_ve_first_epoch = train_ve_first_epoch
+        self.enable_qlora = enable_qlora
         
         # Define validation_dir for all processes
         self.validation_dir = os.path.join(output_dir, "validation_examples")
@@ -102,9 +114,8 @@ class VQATrainerStage2:
         if self.accelerator.is_main_process:
             os.makedirs(output_dir, exist_ok=True)
 
-        # --- Use functools.partial to pass pad_token_id to collate_fn ---
-        # collator in DataLoader receives only the batch argument
-        collate_fn_partial = partial(vqa_collate_fn, pad_token_id=self.tokenizer.pad_token_id)
+        # --- Use functools.partial to pass the tokenizer to collate_fn ---
+        collate_fn_partial = partial(vqa_collate_fn, tokenizer=self.tokenizer)
 
         self.train_loader = DataLoader(
             train_dataset,
@@ -128,7 +139,8 @@ class VQATrainerStage2:
         trainable_params = self._setup_trainable_parameters(
             freeze_vision_encoder=freeze_vision_encoder,
             freeze_projection_layer=freeze_projection_layer,
-            freeze_llm=freeze_llm
+            freeze_llm=freeze_llm,
+            enable_qlora=self.enable_qlora
         )
         self.optimizer = optim.AdamW(
             trainable_params,
@@ -174,29 +186,63 @@ class VQATrainerStage2:
             self.optimizer, self.train_loader, self.val_loader, self.lr_scheduler
         )
 
-    def _setup_trainable_parameters(self, freeze_vision_encoder: bool, freeze_projection_layer: bool, freeze_llm: bool) -> list:
+    def _setup_trainable_parameters(self, freeze_vision_encoder: bool, freeze_projection_layer: bool, freeze_llm: bool, enable_qlora: bool) -> list:
         """Applies freezing strategy and collects parameters for the optimizer."""
-        models = {
-            'vision_encoder': (self.vision_encoder, freeze_vision_encoder),
-            'projection_layer': (self.projection_layer, freeze_projection_layer),
-            'language_model': (self.language_model, freeze_llm)
-        }
-
+        
         trainable_params = []
-        for name, (model, should_freeze) in models.items():
-            if should_freeze:
-                model.requires_grad_(False)
-                logger.info(f"Freezing {name} parameters.")
+        
+        # Handle LLM parameters based on QLoRA flag
+        if enable_qlora:
+            logger.info("QLoRA enabled: Only LLM adapter parameters will be trained.")
+            # PEFT model automatically handles freezing base parameters.
+            # We collect all parameters flagged as requires_grad from the PeftModel.
+            llm_params = list(filter(lambda p: p.requires_grad, self.language_model.parameters()))
+            trainable_params.extend(llm_params)
+            logger.info(f"Collected {len(llm_params)} trainable parameters from QLoRA LLM.")
+        else:
+            # Standard freezing logic for LLM if QLoRA is not enabled
+            if freeze_llm:
+                self.language_model.requires_grad_(False)
+                logger.info("Freezing LLM parameters (QLoRA disabled).")
             else:
-                model.requires_grad_(True)
-                logger.info(f"{name} parameters are trainable.")
-                # Collect parameters only if the model is not frozen
-                trainable_params.extend(list(filter(lambda p: p.requires_grad, model.parameters())))
+                self.language_model.requires_grad_(True)
+                logger.info("LLM parameters are trainable (QLoRA disabled).")
+                llm_params = list(filter(lambda p: p.requires_grad, self.language_model.parameters()))
+                trainable_params.extend(llm_params)
+                logger.info(f"Collected {len(llm_params)} trainable parameters from LLM.")
+
+        # Handle Projector Layer freezing (independent of QLoRA)
+        if freeze_projection_layer:
+            self.projection_layer.requires_grad_(False)
+            logger.info("Freezing projection_layer parameters.")
+        else:
+            self.projection_layer.requires_grad_(True)
+            logger.info("projection_layer parameters are trainable.")
+            proj_params = list(filter(lambda p: p.requires_grad, self.projection_layer.parameters()))
+            trainable_params.extend(proj_params)
+            logger.info(f"Collected {len(proj_params)} trainable parameters from projection_layer.")
+
+        # Handle Vision Encoder freezing (independent of QLoRA)
+        # Note: train_ve_first_epoch logic happens dynamically in train() loop
+        if freeze_vision_encoder:
+            self.vision_encoder.requires_grad_(False)
+            logger.info("Initially freezing vision_encoder parameters (may unfreeze in epoch 1).")
+        else:
+            self.vision_encoder.requires_grad_(True)
+            logger.info("vision_encoder parameters are initially trainable.")
+            # Only add VE params if not initially frozen, dynamic freezing handles epoch 1
+            if not self.train_ve_first_epoch: # Add if not training dynamically in epoch 1
+                ve_params = list(filter(lambda p: p.requires_grad, self.vision_encoder.parameters()))
+                trainable_params.extend(ve_params)
+                logger.info(f"Collected {len(ve_params)} trainable parameters from vision_encoder.")
+            else:
+                logger.info("Vision encoder params handled dynamically in train() loop due to --train_ve_first_epoch.")
+
 
         if not trainable_params:
-            raise ValueError("No trainable parameters found. Check freezing configuration.")
+            raise ValueError("No trainable parameters found. Check freezing configuration and QLoRA setup.")
 
-        logger.info(f"Collected {len(trainable_params)} trainable parameters for the optimizer.")
+        logger.info(f"Collected {len(trainable_params)} total trainable parameters for the optimizer.")
         return trainable_params
 
     def train(self):
@@ -379,14 +425,19 @@ class VQATrainerStage2:
                     # --- Optimizer Step --- #
                     if self.accelerator.sync_gradients:
                         # Clip gradients for the trainable parameters
-                        if any(p.requires_grad for p in self.language_model.parameters()):
-                            self.accelerator.clip_grad_norm_(self.language_model.parameters(), 1.0)
-                        if any(p.requires_grad for p in self.projection_layer.parameters()):
-                            self.accelerator.clip_grad_norm_(self.projection_layer.parameters(), 1.0)
-                        # Add vision encoder clipping if it's being trained
-                        if any(p.requires_grad for p in self.vision_encoder.parameters()):
-                             self.accelerator.clip_grad_norm_(self.vision_encoder.parameters(), 1.0)
-
+                        trainable_modules = []
+                        if any(p.requires_grad for p in self.accelerator.unwrap_model(self.language_model).parameters()):
+                             trainable_modules.append(self.language_model)
+                        if any(p.requires_grad for p in self.accelerator.unwrap_model(self.projection_layer).parameters()):
+                             trainable_modules.append(self.projection_layer)
+                        if any(p.requires_grad for p in self.accelerator.unwrap_model(self.vision_encoder).parameters()):
+                             trainable_modules.append(self.vision_encoder)
+                             
+                        # Clip gradients for all trainable modules prepared by accelerator
+                        for module in trainable_modules:
+                             if module is not None and hasattr(module, 'parameters'):
+                                 self.accelerator.clip_grad_norm_(module.parameters(), 1.0)
+                        
                         self.optimizer.step()
                         self.lr_scheduler.step()
                         self.optimizer.zero_grad()
@@ -430,15 +481,9 @@ class VQATrainerStage2:
 
             # --- Save Checkpoint --- #
             if self.accelerator.is_main_process:
-                 if (epoch + 1) % 2 == 0 or (epoch + 1) == self.num_epochs: # Save every 2 epochs and final
-                     save_path = os.path.join(self.output_dir, f"checkpoint-epoch_{epoch+1}")
-                     self.save_model(save_path)
-
-        # --- Final Save --- #
-        if self.accelerator.is_main_process:
-            final_save_path = os.path.join(self.output_dir, "final_model")
-            self.save_model(final_save_path)
-            logger.info("Final Stage 2 model saved.")
+                 # Always save at the end of each epoch
+                 save_path = os.path.join(self.output_dir, f"checkpoint-epoch_{epoch+1}")
+                 self.save_model(save_path)
 
         logger.info(f"Process {self.accelerator.process_index}: Stage 2 training complete!")
 
@@ -450,6 +495,15 @@ class VQATrainerStage2:
             global_step (int): Current global training step.
         """
         logger.info(f"Starting evaluation for Epoch {epoch+1}...")
+        
+        # Store original padding side and set to left for evaluation
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = 'left'
+        # Ensure the pad token is set if it's None (important for left padding)
+        if self.tokenizer.pad_token_id is None:
+            logger.warning("Tokenizer pad_token_id is None. Setting to eos_token_id for evaluation.")
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
         self.language_model.eval()
         self.projection_layer.eval()
         self.vision_encoder.eval()
@@ -506,7 +560,8 @@ class VQATrainerStage2:
                 q_len = question_input_ids.shape[1]
 
                 visual_attn_mask = torch.ones((batch_size, num_visual_tokens), dtype=torch.long, device=projected_embeds.device)
-                question_attn_mask = torch.ones((batch_size, q_len), dtype=torch.long, device=projected_embeds.device)
+                # Correctly create question mask based on actual token IDs (including padding)
+                question_attn_mask = (question_input_ids != self.tokenizer.pad_token_id).long()
                 answer_attn_mask = (answer_input_ids != self.tokenizer.pad_token_id).long()
                 attention_mask_for_loss = torch.cat([visual_attn_mask, question_attn_mask, answer_attn_mask], dim=1)
 
@@ -544,17 +599,31 @@ class VQATrainerStage2:
                     attention_mask_for_gen = torch.cat([visual_attn_mask, question_attn_mask], dim=1)
 
                     llm_model_unwrapped = self.accelerator.unwrap_model(self.language_model)
-                    generated_outputs = llm_model_unwrapped.generate(
-                        inputs_embeds=inputs_embeds_for_gen,
-                        attention_mask=attention_mask_for_gen,
-                        max_new_tokens=512,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        do_sample=True,
-                        num_beams=3,
-                        top_p=0.9,
-                        top_k=50
-                    )
+                    
+                    # Set up generation config with explicit padding settings for Qwen3 compatibility
+                    gen_kwargs = {
+                        'inputs_embeds': inputs_embeds_for_gen,
+                        'attention_mask': attention_mask_for_gen,
+                        'max_new_tokens': 512,
+                        'eos_token_id': self.tokenizer.eos_token_id,
+                        'pad_token_id': self.tokenizer.pad_token_id,
+                        'do_sample': True,
+                        'num_beams': 3,
+                        'top_p': 0.9,
+                        'top_k': 50
+                    }
+                    
+                    # Add flash attention specific config for Qwen3
+                    if 'qwen' in llm_model_unwrapped.__class__.__name__.lower():
+                        from transformers import GenerationConfig
+                        gen_config = GenerationConfig(
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                            padding_side='left'  # Crucial for Qwen3 with Flash Attention
+                        )
+                        gen_kwargs['generation_config'] = gen_config
+                    
+                    generated_outputs = llm_model_unwrapped.generate(**gen_kwargs)
 
                     # Decode outputs
                     decoded_preds = self.tokenizer.batch_decode(generated_outputs, skip_special_tokens=True)
@@ -633,30 +702,44 @@ class VQATrainerStage2:
         # Set models back to training mode if they were trainable
         self.language_model.train(mode=any(p.requires_grad for p in self.accelerator.unwrap_model(self.language_model).parameters()))
         self.projection_layer.train(mode=any(p.requires_grad for p in self.accelerator.unwrap_model(self.projection_layer).parameters()))
+        
+        # Restore original tokenizer padding side
+        self.tokenizer.padding_side = original_padding_side
         logger.info("Evaluation finished.")
 
     def save_model(self, path):
-        """Saves the trainable components (LLM, Projector) (main process only)"""
+        """Saves the trainable components (Adapters if QLoRA, else full models if unfrozen) (main process only)"""
         if not self.accelerator.is_main_process:
             return
 
         os.makedirs(path, exist_ok=True)
 
-        # Save components using accelerator.save_state
-        # This saves optimizer, scheduler, and potentially other states managed by accelerator
-        # It also saves the models handled by accelerator.prepare
+        # Save accelerator state (optimizer, scheduler, etc.)
         self.accelerator.save_state(path)
-        logger.info(f"Full training state (models, optimizer, scheduler) saved to {path} using accelerator.save_state")
+        logger.info(f"Full training state (optimizer, scheduler) saved to {path} using accelerator.save_state")
 
-        # Additionally, save model weights separately for easier loading in inference
-        # --- Save Language Model (if trained) --- #
+        # --- Save Language Model / Adapters --- #
         unwrapped_llm = self.accelerator.unwrap_model(self.language_model)
-        if any(p.requires_grad for p in unwrapped_llm.parameters()):
-             llm_save_path = os.path.join(path, "language_model")
+        llm_save_path = os.path.join(path, "language_model") # Define save path
+        if self.enable_qlora:
+            logger.info("Saving QLoRA adapters using PEFT save_pretrained...")
+            # Save only the adapters using PEFT's method
+            # self.accelerator.save_model(unwrapped_llm, llm_save_path) # Using accelerator might not save adapter_config.json properly
+            unwrapped_llm.save_pretrained(llm_save_path)
+            logger.info(f"QLoRA adapters saved to {llm_save_path}")
+        elif any(p.requires_grad for p in unwrapped_llm.parameters()): # Save full model only if not QLoRA and it was trained
+             logger.info("Saving full fine-tuned language model...")
+             # Use accelerator.save_model for saving the full model if needed
              self.accelerator.save_model(unwrapped_llm, llm_save_path)
-             # unwrapped_llm.save_pretrained(llm_save_path) # Use accelerator's method
-             self.tokenizer.save_pretrained(llm_save_path) # Save tokenizer alongside model
-             logger.info(f"Language model saved to {llm_save_path}")
+             # unwrapped_llm.save_pretrained(llm_save_path) # Alternative HF way
+             logger.info(f"Full language model saved to {llm_save_path}")
+        else:
+             logger.info("Language model was frozen and not saved.")
+             
+        # Always save tokenizer with the LLM/adapters
+        if self.enable_qlora or any(p.requires_grad for p in unwrapped_llm.parameters()):
+            self.tokenizer.save_pretrained(llm_save_path) 
+            logger.info(f"Tokenizer saved to {llm_save_path}")
 
         # --- Save Projection Layer (if trained) --- #
         unwrapped_proj = self.accelerator.unwrap_model(self.projection_layer)
