@@ -515,30 +515,34 @@ def train_vision_encoder(args, is_distributed, rank, world_size, device, wandb_r
         raise
     
     try:
-        num_workers = min(4, os.cpu_count() // world_size if world_size > 0 else os.cpu_count())
-        num_workers = max(1, num_workers) # Ensure at least 1 worker
+        # num_workers = min(4, os.cpu_count() // world_size if world_size > 0 else os.cpu_count())
+        # num_workers = max(1, num_workers) # Ensure at least 1 worker
+        # if rank == 0:
+        #     logger.info(f"Using {num_workers} dataloader workers per GPU")
         if rank == 0:
-            logger.info(f"Using {num_workers} dataloader workers per GPU")
-        
+             logger.info(f"Setting num_workers=0 for DataLoader debugging.")
+
         train_loader = DataLoader(
             train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-            sampler=train_sampler, num_workers=num_workers, collate_fn=full_dataset.collate_fn,
-            pin_memory=True, drop_last=True 
+            sampler=train_sampler, num_workers=0, # SET TO 0 FOR DEBUGGING
+            collate_fn=full_dataset.collate_fn,
+            pin_memory=True, drop_last=True
         )
-        
+
         # Only create val_loader if val_dataset is not empty
         val_loader = None
         if len(val_dataset) > 0:
             val_loader = DataLoader(
                 val_dataset, batch_size=args.batch_size, shuffle=False, sampler=val_sampler,
-                num_workers=num_workers, collate_fn=full_dataset.collate_fn, pin_memory=True
+                num_workers=0, # SET TO 0 FOR DEBUGGING
+                collate_fn=full_dataset.collate_fn, pin_memory=True
             )
-            if rank == 0: logger.info(f"Created val_loader with {len(val_loader)} batches.")
+            if rank == 0: logger.info(f"Created val_loader with {len(val_loader)} batches (num_workers=0).")
         elif rank == 0:
             logger.warning("Validation dataset is empty, val_loader not created. Validation will be skipped or yield zero metrics.")
 
         if rank == 0:
-            logger.info(f"Created train_loader with {len(train_loader)} batches.")
+            logger.info(f"Created train_loader with {len(train_loader)} batches (num_workers=0).")
             if not val_loader : logger.info("val_loader is None.")
 
     except Exception as e:
@@ -613,17 +617,33 @@ def train_vision_encoder(args, is_distributed, rank, world_size, device, wandb_r
         logger.info(f"Starting training for {args.num_epochs} epochs")
             
     for epoch in range(args.num_epochs):
-        if train_sampler is not None: train_sampler.set_epoch(epoch)
+        # --- Start of Epoch Logging ---
+        logger.info(f"Rank {rank} starting Epoch {epoch+1}/{args.num_epochs}")
+
+        if train_sampler is not None:
+            logger.info(f"Rank {rank} calling train_sampler.set_epoch({epoch}) for Epoch {epoch+1}")
+            train_sampler.set_epoch(epoch)
+            logger.info(f"Rank {rank} finished train_sampler.set_epoch({epoch}) for Epoch {epoch+1}")
+        
         # val_sampler set_epoch is not strictly needed if shuffle=False, but good practice
-        if val_sampler is not None: val_sampler.set_epoch(epoch) 
+        if val_sampler is not None: 
+            # No need to log this one extensively unless validation also hangs
+            val_sampler.set_epoch(epoch) 
             
         model.train()
+        logger.info(f"Rank {rank} set model to train mode for Epoch {epoch+1}")
         epoch_loss = 0.0
         processed_batches_in_epoch = 0
 
+        # --- Start of Train Loader Iteration Logging ---
+        logger.info(f"Rank {rank} entering train_loader iteration for Epoch {epoch+1}")
         train_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}", disable=(rank != 0), dynamic_ncols=True)
 
         for step, batch in enumerate(train_iter):
+            # --- Start of Step Logging (only for first step) ---
+            if step == 0:
+                logger.info(f"Rank {rank} received first batch (step 0) for Epoch {epoch+1}")
+            
             if not batch["valid_batch"]: # Skip if collate_fn marked batch as invalid
                 if rank == 0: logger.warning(f"Skipping invalid batch at epoch {epoch+1}, step {step}")
                 continue
@@ -633,8 +653,11 @@ def train_vision_encoder(args, is_distributed, rank, world_size, device, wandb_r
             attention_mask = batch["attention_mask"].to(device)
 
             try:
+                # --- Forward Pass Logging (only for first step) ---
+                if step == 0:
+                    logger.info(f"Rank {rank} starting forward pass for Epoch {epoch+1}, Step 0")
+                
                 # Forward pass
-                # The model might be DDP wrapped or not.
                 current_model_to_call = model.module if is_distributed else model
                 
                 outputs = current_model_to_call(
@@ -657,7 +680,7 @@ def train_vision_encoder(args, is_distributed, rank, world_size, device, wandb_r
                     logger.error(f"Epoch {epoch+1}, Step {step}: Could not extract image or text features. Skipping batch.")
                     if rank==0: logger.info(f"Output keys: {outputs.keys() if outputs else 'None'}")
                     continue
-                    
+                
                 loss = siglip_loss(
                     image_features=image_features,
                     text_features=text_features,
@@ -666,13 +689,28 @@ def train_vision_encoder(args, is_distributed, rank, world_size, device, wandb_r
                 )
                 loss = loss / args.gradient_accumulation_steps
 
+                if step == 0:
+                    logger.info(f"Rank {rank} finished forward pass and loss calculation for Epoch {epoch+1}, Step 0")
+
             except Exception as e:
                 logger.error(f"Error in forward/loss pass at epoch {epoch+1}, step {step}: {e}", exc_info=True)
                 continue # Skip batch on error
             
-            # Backward and optimize
-            loss.backward()
+            # --- Backward Pass Logging (only for first step) ---
+            if step == 0:
+                 logger.info(f"Rank {rank} calling loss.backward() for Epoch {epoch+1}, Step 0")
             
+            # Backward and optimize
+            try:
+                loss.backward()
+                if step == 0:
+                    logger.info(f"Rank {rank} finished loss.backward() for Epoch {epoch+1}, Step 0")
+            except Exception as backward_e:
+                logger.error(f"Rank {rank} Error during loss.backward() at epoch {epoch+1}, step {step}: {backward_e}", exc_info=True)
+                # Decide if we should break or continue, continuing might lead to more errors
+                # For now, let's re-raise to halt execution on backward error
+                raise backward_e
+
             if (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == len(train_loader):
                 optimizer.step()
                 lr_scheduler.step()
@@ -681,7 +719,7 @@ def train_vision_encoder(args, is_distributed, rank, world_size, device, wandb_r
             epoch_loss += loss.item() * args.gradient_accumulation_steps # Scale back for logging
             processed_batches_in_epoch += 1
             global_step += 1
-
+            
             if global_step % args.logging_steps == 0 and rank == 0:
                 current_lr = lr_scheduler.get_last_lr()[0]
                 logger.info(f"Epoch {epoch+1}, Step {global_step} - Loss: {loss.item() * args.gradient_accumulation_steps:.4f}, LR: {current_lr:.6e}")
@@ -706,8 +744,6 @@ def train_vision_encoder(args, is_distributed, rank, world_size, device, wandb_r
             if wandb_run is not None:
                 wandb_run.log({"train/epoch_loss": avg_epoch_loss, "train/epoch_completed": epoch + 1})
         
-        if is_distributed: dist.barrier()
-            
         # Run validation
         if val_loader is not None and len(val_loader) > 0:
             if rank == 0:
@@ -753,19 +789,53 @@ def train_vision_encoder(args, is_distributed, rank, world_size, device, wandb_r
         elif rank == 0:
             logger.info(f"Skipping validation for epoch {epoch+1} as val_loader is None or empty.")
 
+        # --- Synchronization Barrier BEFORE Saving ---
+        # Ensure all processes wait here after validation is done by all ranks
+        # before Rank 0 proceeds with potentially long saving operations.
+        if is_distributed:
+            logger.info(f"Rank {rank} reaching synchronization barrier BEFORE saving after epoch {epoch+1}")
+            dist.barrier()
+            logger.info(f"Rank {rank} passed synchronization barrier BEFORE saving after epoch {epoch+1}")
 
-        # Save checkpoint
+        # --- Save Best Model (Rank 0 only) ---
+        # This now happens AFTER the barrier, so other ranks wait if Rank 0 saves.
+        if rank == 0:
+            # Check if validation happened and produced metrics
+            if val_loader is not None and len(val_loader) > 0 and 'val_metrics' in locals():
+                 if val_metrics["accuracy"] > 0 and val_metrics["accuracy"] > best_val_accuracy: # Ensure accuracy is somewhat meaningful
+                        best_val_accuracy = val_metrics["accuracy"]
+                        best_model_dir = os.path.join(args.output_dir, "best_model")
+                        os.makedirs(best_model_dir, exist_ok=True)
+                        model_to_save = model.module if hasattr(model, 'module') else model
+                        try:
+                            model_to_save.save_pretrained(best_model_dir)
+                            processor.save_pretrained(best_model_dir)
+                            tokenizer.save_pretrained(best_model_dir) # Save tokenizer too
+                            logger.info(f"Saved new best model with accuracy: {best_val_accuracy:.4f} to {best_model_dir}")
+                        except Exception as save_e:
+                            logger.error(f"Error saving best model to {best_model_dir}: {save_e}")
+            elif val_loader is None or len(val_loader) == 0:
+                # Log if saving is skipped because validation didn't run
+                logger.info(f"Skipping best model check for epoch {epoch+1} as validation did not run.")
+            # Add any other necessary checks if val_metrics might not be defined
+
+        # --- Save Checkpoint (Rank 0 only) ---
+        # Also happens AFTER the barrier.
         if rank == 0 and args.save_every_n_epochs > 0 and ((epoch + 1) % args.save_every_n_epochs == 0 or epoch == args.num_epochs - 1):
             if (epoch + 1) >= args.min_save_epoch :
                 checkpoint_dir = os.path.join(args.output_dir, f"epoch_{epoch+1}")
                 os.makedirs(checkpoint_dir, exist_ok=True)
                 model_to_save = model.module if hasattr(model, 'module') else model
-                model_to_save.save_pretrained(checkpoint_dir)
-                processor.save_pretrained(checkpoint_dir)
-                tokenizer.save_pretrained(checkpoint_dir)
-                logger.info(f"Saved checkpoint for epoch {epoch+1} to {checkpoint_dir}")
+                try:
+                    model_to_save.save_pretrained(checkpoint_dir)
+                    processor.save_pretrained(checkpoint_dir)
+                    tokenizer.save_pretrained(checkpoint_dir)
+                    logger.info(f"Saved checkpoint for epoch {epoch+1} to {checkpoint_dir}")
+                except Exception as save_e:
+                     logger.error(f"Error saving checkpoint model to {checkpoint_dir}: {save_e}")
                 
-        if is_distributed: dist.barrier()
+        # --- [Barrier at the very end of the loop removed] ---
+        # The primary barrier is now before saving.
     
     if rank == 0:
         logger.info("Training complete!")
