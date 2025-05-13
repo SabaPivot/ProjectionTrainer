@@ -25,6 +25,7 @@ if [ "$USE_ONLINE_AUGMENTATION" = true ] ; then
     ONLINE_AUG_FLAG="--use_online_augmentation"
 fi
 
+
 # --- Training Hyperparameters ---
 BATCH_SIZE=16
 LEARNING_RATE=5e-5
@@ -32,7 +33,7 @@ WEIGHT_DECAY=0.01
 NUM_EPOCHS=100
 GRAD_ACCUM_STEPS=4
 WARMUP_RATIO=0.05
-MAX_TEXT_LEN=64
+MAX_TEXT_LEN=128
 
 # --- Output & Logging ---
 RUN_NAME="SigLIP_FineTune_$(basename $MODEL_NAME)_lr${LEARNING_RATE}_bs${BATCH_SIZE}_ep${NUM_EPOCHS}_$(date +%Y%m%d_%H%M%S)"
